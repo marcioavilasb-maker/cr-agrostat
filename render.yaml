@@ -1,0 +1,5 @@
+services:
+  - type: web
+    name: cr-agrostat-sul
+    runtime: docker
+    plan: free
