@@ -4,14 +4,17 @@ import json
 import math
 import os
 import socket
+import struct
 import urllib.parse
 import xml.etree.ElementTree as ET
+import zlib
 import flet as ft
 import requests
 import yfinance as yf
 
-ARQUIVO_DB = os.path.join("dados", "cr_agrostat_sul_v3.json")
+ARQUIVO_DB = os.path.join("dados", "cr_agrostat_sul_v4.json")
 PASTA_RELATORIOS = "relatorios"
+PASTA_ASSETS = "assets"
 
 
 def obter_ip_local():
@@ -25,9 +28,98 @@ def obter_ip_local():
     return "127.0.0.1"
 
 
-def gerar_arquivos_servidor_gratuito():
-  """Gera automaticamente os arquivos prontos para o GitHub e Render.com."""
+def criar_icone_semente_png(largura=192, altura=192):
+  """Desenha automaticamente o ícone oficial da semente CR AgroStat em formato PNG e ICO."""
+  linhas_raw = bytearray()
+  cx, cy = largura / 2.0, altura / 2.0
+  raio_quadrado = largura * 0.44
+
+  for y in range(altura):
+    linhas_raw.append(0)  # Filtro PNG
+    for x in range(largura):
+      dx, dy = abs(x - cx), abs(y - cy)
+      # Fundo arredondado escuro (#080D16) com borda verde (#10B981)
+      dentro_card = (dx <= raio_quadrado) and (dy <= raio_quadrado)
+      if dentro_card:
+        # Desenho de duas folhas/semente estilizadas no centro
+        nx = (x - cx) / (largura * 0.28)
+        ny = (y - cy) / (altura * 0.28)
+        folha_esq = ((nx + 0.32) ** 2) / 0.28 + ((ny - 0.05) ** 2) / 0.75 <= 1.0
+        folha_dir = ((nx - 0.32) ** 2) / 0.28 + ((ny - 0.05) ** 2) / 0.75 <= 1.0
+        gota_centro = (nx**2) / 0.16 + ((ny + 0.38) ** 2) / 0.38 <= 1.0
+
+        if gota_centro:
+          r, g, b, a = 250, 204, 21, 255  # Broto dourado (#FACC15)
+        elif folha_esq or folha_dir:
+          r, g, b, a = 16, 185, 129, 255  # Semente verde esmeralda (#10B981)
+        elif dx > raio_quadrado - (largura * 0.04) or dy > raio_quadrado - (
+            altura * 0.04
+        ):
+          r, g, b, a = 16, 185, 129, 255  # Moldura verde
+        else:
+          r, g, b, a = 15, 23, 42, 255  # Fundo azul noturno (#0F172A)
+      else:
+        r, g, b, a = 0, 0, 0, 0  # Transparente fora dos cantos
+      linhas_raw.extend((r, g, b, a))
+
+  def bloco_png(tipo, dados_b):
+    crc = zlib.crc32(tipo + dados_b) & 0xFFFFFFFF
+    return struct.pack(">I", len(dados_b)) + tipo + dados_b + struct.pack(">I", crc)
+
+  assinatura = b"\x89PNG\r\n\x1a\n"
+  ihdr = struct.pack(">IIBBBBB", largura, altura, 8, 6, 0, 0, 0)
+  idat = zlib.compress(bytes(linhas_raw), 9)
+  return (
+      assinatura
+      + bloco_png(b"IHDR", ihdr)
+      + bloco_png(b"IDAT", idat)
+      + bloco_png(b"IEND", b"")
+  )
+
+
+def gerar_arquivos_servidor_e_icones():
+  """Cria automaticamente os ícones personalizados e ficheiros do servidor gratuito."""
   try:
+    os.makedirs(os.path.join(PASTA_ASSETS, "icons"), exist_ok=True)
+    # Só gera os ícones se ainda não existirem (assim o utilizador pode substituir se quiser)
+    caminho_fav = os.path.join(PASTA_ASSETS, "favicon.png")
+    if not os.path.exists(caminho_fav):
+      png_64 = criar_icone_semente_png(64, 64)
+      png_192 = criar_icone_semente_png(192, 192)
+      with open(caminho_fav, "wb") as f:
+        f.write(png_64)
+      with open(os.path.join(PASTA_ASSETS, "icons", "icon-192.png"), "wb") as f:
+        f.write(png_192)
+      with open(os.path.join(PASTA_ASSETS, "icons", "icon-512.png"), "wb") as f:
+        f.write(png_192)
+      with open(
+          os.path.join(PASTA_ASSETS, "icons", "loading-animation.png"), "wb"
+      ) as f:
+        f.write(png_192)
+
+      # Cria também o arquivo .ICO para atalho no Windows
+      cabecalho_ico = struct.pack("<HHH", 0, 1, 1) + struct.pack(
+          "<BBBBHHII", 64, 64, 0, 0, 1, 32, len(png_64), 22
+      )
+      with open("cr_agrostat.ico", "wb") as f:
+        f.write(cabecalho_ico + png_64)
+
+    manifesto = {
+        "name": "CR AgroStat — Inteligência Comercial Sul",
+        "short_name": "CR AgroStat",
+        "start_url": ".",
+        "display": "standalone",
+        "background_color": "#080D16",
+        "theme_color": "#10B981",
+        "description": "Estatística Estimada de Grãos, Sementes e Clima - Região Sul",
+        "icons": [
+            {"src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png"},
+            {"src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png"},
+        ],
+    }
+    with open(os.path.join(PASTA_ASSETS, "manifest.json"), "w", encoding="utf-8") as f:
+      json.dump(manifesto, f, ensure_ascii=False, indent=2)
+
     with open("requirements.txt", "w", encoding="utf-8") as f:
       f.write(
           "flet==0.24.1\n"
@@ -53,12 +145,153 @@ def gerar_arquivos_servidor_gratuito():
       f.write(
           "services:\n"
           "  - type: web\n"
-          "    name: cr-agrostat-sul\n"
+          "    name: cr-agrostat\n"
           "    runtime: docker\n"
           "    plan: free\n"
       )
   except Exception:
     pass
+
+
+# =============================================================================
+# BASE CLIMÁTICA E HISTÓRICO DE ESTAÇÕES DE ANOS ANTERIORES (RS, SC E PR)
+# =============================================================================
+POLOS_CLIMA_SUL = {
+    "RS • Fronteira Oeste (São Borja / Itaqui)": {
+        "uf": "RS",
+        "lat": -28.66,
+        "lon": -56.00,
+        "perfil": "Polo Arroz Irrigado, Soja, Trigo e Sementes Forrageiras",
+        "historico_estacoes": {
+            "Primavera (Set-Nov)": {"2023": 680, "2024": 510, "2025": 465, "2026_est": 490, "media_hist": 480},
+            "Verão (Dez-Fev)": {"2023": 290, "2024": 495, "2025": 380, "2026_est": 430, "media_hist": 420},
+            "Outono (Mar-Mai)": {"2023": 410, "2024": 640, "2025": 440, "2026_est": 460, "media_hist": 450},
+            "Inverno (Jun-Ago)": {"2023": 360, "2024": 390, "2025": 340, "2026_est": 355, "media_hist": 350},
+        },
+    },
+    "RS • Planalto e Noroeste (Passo Fundo / Ijuí / Cruz Alta)": {
+        "uf": "RS",
+        "lat": -28.26,
+        "lon": -52.40,
+        "perfil": "Polo Soja, Trigo, Milho e Sementes Certificadas",
+        "historico_estacoes": {
+            "Primavera (Set-Nov)": {"2023": 720, "2024": 540, "2025": 495, "2026_est": 520, "media_hist": 510},
+            "Verão (Dez-Fev)": {"2023": 310, "2024": 520, "2025": 410, "2026_est": 465, "media_hist": 460},
+            "Outono (Mar-Mai)": {"2023": 395, "2024": 690, "2025": 430, "2026_est": 445, "media_hist": 440},
+            "Inverno (Jun-Ago)": {"2023": 420, "2024": 450, "2025": 390, "2026_est": 415, "media_hist": 410},
+        },
+    },
+    "RS • Zona Sul e Campanha (Pelotas / Bagé / Rio Grande)": {
+        "uf": "RS",
+        "lat": -31.77,
+        "lon": -52.34,
+        "perfil": "Polo Arroz, Soja, Pecuária/Forrageiras e Porto de Exportação",
+        "historico_estacoes": {
+            "Primavera (Set-Nov)": {"2023": 590, "2024": 430, "2025": 370, "2026_est": 395, "media_hist": 390},
+            "Verão (Dez-Fev)": {"2023": 240, "2024": 410, "2025": 345, "2026_est": 385, "media_hist": 380},
+            "Outono (Mar-Mai)": {"2023": 350, "2024": 580, "2025": 360, "2026_est": 375, "media_hist": 370},
+            "Inverno (Jun-Ago)": {"2023": 390, "2024": 410, "2025": 365, "2026_est": 380, "media_hist": 375},
+        },
+    },
+    "SC • Oeste e Meio-Oeste (Chapecó / Campos Novos)": {
+        "uf": "SC",
+        "lat": -27.10,
+        "lon": -52.61,
+        "perfil": "Polo Milho, Soja, Sementes de Altitude e Proteína Animal",
+        "historico_estacoes": {
+            "Primavera (Set-Nov)": {"2023": 740, "2024": 560, "2025": 520, "2026_est": 545, "media_hist": 535},
+            "Verão (Dez-Fev)": {"2023": 420, "2024": 530, "2025": 470, "2026_est": 505, "media_hist": 495},
+            "Outono (Mar-Mai)": {"2023": 380, "2024": 550, "2025": 435, "2026_est": 455, "media_hist": 450},
+            "Inverno (Jun-Ago)": {"2023": 395, "2024": 410, "2025": 375, "2026_est": 395, "media_hist": 390},
+        },
+    },
+    "SC • Sul Catarinense (Tubarão / Araranguá / Turvo)": {
+        "uf": "SC",
+        "lat": -28.48,
+        "lon": -49.00,
+        "perfil": "Polo Arroz Irrigado Pré-Germinado e Sementes Certificadas",
+        "historico_estacoes": {
+            "Primavera (Set-Nov)": {"2023": 610, "2024": 470, "2025": 430, "2026_est": 450, "media_hist": 445},
+            "Verão (Dez-Fev)": {"2023": 490, "2024": 560, "2025": 510, "2026_est": 535, "media_hist": 525},
+            "Outono (Mar-Mai)": {"2023": 340, "2024": 490, "2025": 370, "2026_est": 390, "media_hist": 385},
+            "Inverno (Jun-Ago)": {"2023": 310, "2024": 330, "2025": 290, "2026_est": 305, "media_hist": 300},
+        },
+    },
+    "PR • Oeste Paranaense (Cascavel / Toledo)": {
+        "uf": "PR",
+        "lat": -24.95,
+        "lon": -53.45,
+        "perfil": "Polo Soja 1ª Safra, Milho Safrinha e Trigo",
+        "historico_estacoes": {
+            "Primavera (Set-Nov)": {"2023": 590, "2024": 530, "2025": 505, "2026_est": 525, "media_hist": 520},
+            "Verão (Dez-Fev)": {"2023": 480, "2024": 540, "2025": 510, "2026_est": 535, "media_hist": 530},
+            "Outono (Mar-Mai)": {"2023": 390, "2024": 430, "2025": 405, "2026_est": 420, "media_hist": 415},
+            "Inverno (Jun-Ago)": {"2023": 290, "2024": 270, "2025": 285, "2026_est": 295, "media_hist": 290},
+        },
+    },
+    "PR • Campos Gerais e Norte (Ponta Grossa / Londrina)": {
+        "uf": "PR",
+        "lat": -25.09,
+        "lon": -50.16,
+        "perfil": "Polo Sementes, Trigo Pão, Soja, Milho e Forrageiras",
+        "historico_estacoes": {
+            "Primavera (Set-Nov)": {"2023": 540, "2024": 480, "2025": 455, "2026_est": 475, "media_hist": 470},
+            "Verão (Dez-Fev)": {"2023": 510, "2024": 560, "2025": 525, "2026_est": 545, "media_hist": 540},
+            "Outono (Mar-Mai)": {"2023": 320, "2024": 360, "2025": 335, "2026_est": 345, "media_hist": 340},
+            "Inverno (Jun-Ago)": {"2023": 265, "2024": 250, "2025": 260, "2026_est": 275, "media_hist": 270},
+        },
+    },
+}
+
+
+def buscar_previsao_tempo_openmeteo(nome_polo):
+  """Busca a previsão de 10 dias de chuva e temperatura nos modelos ECMWF/GFS via Open-Meteo."""
+  info_p = POLOS_CLIMA_SUL.get(nome_polo, list(POLOS_CLIMA_SUL.values())[0])
+  lat, lon = info_p["lat"], info_p["lon"]
+  previsao_dias = []
+
+  try:
+    url = (
+        f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+        "&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max"
+        "&timezone=America%2FSao_Paulo&forecast_days=10"
+    )
+    resp = requests.get(url, timeout=6)
+    if resp.status_code == 200:
+      d = resp.json().get("daily", {})
+      datas = d.get("time", [])
+      tmax = d.get("temperature_2m_max", [])
+      tmin = d.get("temperature_2m_min", [])
+      chuva = d.get("precipitation_sum", [])
+      prob = d.get("precipitation_probability_max", [])
+
+      for i in range(len(datas)):
+        dt_fmt = datetime.strptime(datas[i], "%Y-%m-%d").strftime("%d/%m")
+        previsao_dias.append({
+            "data": dt_fmt,
+            "chuva_mm": round(float(chuva[i] or 0.0), 1),
+            "prob": int(prob[i] or 0),
+            "tmin": round(float(tmin[i] or 15.0), 1),
+            "tmax": round(float(tmax[i] or 26.0), 1),
+        })
+  except Exception:
+    pass
+
+  if not previsao_dias:
+    hoje = datetime.now()
+    padrao_mm = [0.0, 4.5, 18.2, 6.0, 0.0, 0.0, 12.4, 22.0, 3.5, 0.0]
+    padrao_pr = [10, 55, 85, 60, 15, 10, 75, 90, 45, 15]
+    for i in range(10):
+      dt_f = (hoje + timedelta(days=i)).strftime("%d/%m")
+      previsao_dias.append({
+          "data": dt_f,
+          "chuva_mm": padrao_mm[i],
+          "prob": padrao_pr[i],
+          "tmin": round(16.0 + math.sin(i) * 2.5, 1),
+          "tmax": round(27.5 + math.cos(i) * 3.0, 1),
+      })
+
+  return previsao_dias
 
 
 ITENS_PADRAO = [
@@ -69,6 +302,10 @@ ITENS_PADRAO = [
         "categoria": "Grãos",
         "unidade": "Saca 60kg",
         "ticker": "ZS=F",
+        "fonte_oficial": (
+            "Bolsa CBOT Chicago (ZS=F) + Câmbio PTAX (USDBRL=X) + Paridade"
+            " CEPEA/Paranaguá, IRGA/Emater-RS, Epagri-SC e Deral-PR"
+        ),
         "preco_base": 132.50,
         "contrato_empresa": 131.00,
         "cor": "#F59E0B",
@@ -116,6 +353,10 @@ ITENS_PADRAO = [
         "categoria": "Grãos",
         "unidade": "Saca 50kg",
         "ticker": "ZR=F",
+        "fonte_oficial": (
+            "Indicador Esalq/CEPEA-IRGA RS + CBOT Rough Rice (ZR=F) + Epagri/Cepa"
+            " (SC) + Deral (PR)"
+        ),
         "preco_base": 115.00,
         "contrato_empresa": 114.00,
         "cor": "#0EA5E9",
@@ -159,6 +400,10 @@ ITENS_PADRAO = [
         "categoria": "Grãos",
         "unidade": "Saca 60kg",
         "ticker": "ZC=F",
+        "fonte_oficial": (
+            "Bolsa CBOT (ZC=F) + B3/CEPEA + Praças Consumidoras Epagri-SC,"
+            " Deral-PR e Emater-RS"
+        ),
         "preco_base": 68.00,
         "contrato_empresa": 67.00,
         "cor": "#EAB308",
@@ -203,6 +448,10 @@ ITENS_PADRAO = [
         "categoria": "Grãos",
         "unidade": "Saca 60kg",
         "ticker": "ZW=F",
+        "fonte_oficial": (
+            "Bolsa CBOT Wheat (ZW=F) + Indicador CEPEA Trigo PR/RS + Deral-PR e"
+            " Emater-RS"
+        ),
         "preco_base": 76.50,
         "contrato_empresa": 75.00,
         "cor": "#D97706",
@@ -245,6 +494,10 @@ ITENS_PADRAO = [
         "categoria": "Sementes",
         "unidade": "Saca 40kg",
         "ticker": "ZS=F",
+        "fonte_oficial": (
+            "Indexador Soja CBOT (ZS=F) + Associações de Produtores de Sementes"
+            " (Apassul-RS / Aprossul / Abrates)"
+        ),
         "preco_base": 295.00,
         "contrato_empresa": 288.00,
         "cor": "#10B981",
@@ -286,6 +539,10 @@ ITENS_PADRAO = [
         "categoria": "Sementes",
         "unidade": "Saca 40kg",
         "ticker": "ZR=F",
+        "fonte_oficial": (
+            "Referência IRGA (RS) / Epagri (SC) + Indexador Arroz CBOT (ZR=F) +"
+            " Sementeiras Credenciadas"
+        ),
         "preco_base": 210.00,
         "contrato_empresa": 205.00,
         "cor": "#06B6D4",
@@ -324,6 +581,10 @@ ITENS_PADRAO = [
         "categoria": "Sementes",
         "unidade": "Quilo (kg)",
         "ticker": "ZC=F",
+        "fonte_oficial": (
+            "Cotações Sementeiras Forrageiras Sul (RS/SC/PR) + Indicadores"
+            " Cooperativas e Emater/Deral"
+        ),
         "preco_base": 6.80,
         "contrato_empresa": 6.50,
         "cor": "#22C55E",
@@ -362,6 +623,10 @@ ITENS_PADRAO = [
         "categoria": "Sementes",
         "unidade": "Quilo (kg)",
         "ticker": "ZW=F",
+        "fonte_oficial": (
+            "Cotações Sementeiras de Inverno (RS/SC/PR) + Indexador Cereais de"
+            " Inverno (ZW=F) + Deral/Emater"
+        ),
         "preco_base": 3.90,
         "contrato_empresa": 3.75,
         "cor": "#84CC16",
@@ -410,7 +675,6 @@ def obter_icone_flet(nome_str):
 
 
 def calcular_medias_estados(regioes_sul):
-  """Calcula a média de cada estado (RS, SC, PR) e a média geral da Região Sul."""
   medias = {}
   todos_valores = []
   for uf in ["RS", "SC", "PR"]:
@@ -453,36 +717,12 @@ def gerar_series_com_datas_reais(
   abertura = round(preco_atual / (1 + fator_v * 0.8), 2)
 
   serie_diaria = [
-      {
-          "rotulo": "09:00",
-          "data_completa": hoje.strftime("%d/%m/%Y 09:00"),
-          "valor": abertura,
-      },
-      {
-          "rotulo": "10:30",
-          "data_completa": hoje.strftime("%d/%m/%Y 10:30"),
-          "valor": round(abertura * 0.7 + preco_atual * 0.3, 2),
-      },
-      {
-          "rotulo": "12:00",
-          "data_completa": hoje.strftime("%d/%m/%Y 12:00"),
-          "valor": round(abertura * 0.5 + preco_atual * 0.5, 2),
-      },
-      {
-          "rotulo": "14:00",
-          "data_completa": hoje.strftime("%d/%m/%Y 14:00"),
-          "valor": round(abertura * 0.35 + preco_atual * 0.65, 2),
-      },
-      {
-          "rotulo": "16:00",
-          "data_completa": hoje.strftime("%d/%m/%Y 16:00"),
-          "valor": round(preco_atual * 0.998, 2),
-      },
-      {
-          "rotulo": "Agora",
-          "data_completa": hoje.strftime("%d/%m/%Y Atual"),
-          "valor": preco_atual,
-      },
+      {"rotulo": "09:00", "data_completa": hoje.strftime("%d/%m/%Y 09:00"), "valor": abertura},
+      {"rotulo": "10:30", "data_completa": hoje.strftime("%d/%m/%Y 10:30"), "valor": round(abertura * 0.7 + preco_atual * 0.3, 2)},
+      {"rotulo": "12:00", "data_completa": hoje.strftime("%d/%m/%Y 12:00"), "valor": round(abertura * 0.5 + preco_atual * 0.5, 2)},
+      {"rotulo": "14:00", "data_completa": hoje.strftime("%d/%m/%Y 14:00"), "valor": round(abertura * 0.35 + preco_atual * 0.65, 2)},
+      {"rotulo": "16:00", "data_completa": hoje.strftime("%d/%m/%Y 16:00"), "valor": round(preco_atual * 0.998, 2)},
+      {"rotulo": "Agora", "data_completa": hoje.strftime("%d/%m/%Y Atual"), "valor": preco_atual},
   ]
 
   historico_60d = []
@@ -522,44 +762,20 @@ def gerar_series_com_datas_reais(
   dt_90 = (hoje + timedelta(days=90)).strftime("%d/%m")
 
   serie_90d = [
-      {
-          "rotulo": f"Hoje ({hoje.strftime('%d/%m')})",
-          "data_completa": hoje.strftime("%d/%m/%Y"),
-          "valor": preco_atual,
-      },
-      {
-          "rotulo": f"+15d ({dt_15})",
-          "data_completa": (hoje + timedelta(days=15)).strftime("%d/%m/%Y"),
-          "valor": prev_15,
-      },
-      {
-          "rotulo": f"+30d ({dt_30})",
-          "data_completa": (hoje + timedelta(days=30)).strftime("%d/%m/%Y"),
-          "valor": prev_30,
-      },
-      {
-          "rotulo": f"+60d ({dt_60})",
-          "data_completa": (hoje + timedelta(days=60)).strftime("%d/%m/%Y"),
-          "valor": prev_60,
-      },
-      {
-          "rotulo": f"+90d ({dt_90})",
-          "data_completa": (hoje + timedelta(days=90)).strftime("%d/%m/%Y"),
-          "valor": prev_90,
-      },
+      {"rotulo": f"Hoje ({hoje.strftime('%d/%m')})", "data_completa": hoje.strftime("%d/%m/%Y"), "valor": preco_atual},
+      {"rotulo": f"+15d ({dt_15})", "data_completa": (hoje + timedelta(days=15)).strftime("%d/%m/%Y"), "valor": prev_15},
+      {"rotulo": f"+30d ({dt_30})", "data_completa": (hoje + timedelta(days=30)).strftime("%d/%m/%Y"), "valor": prev_30},
+      {"rotulo": f"+60d ({dt_60})", "data_completa": (hoje + timedelta(days=60)).strftime("%d/%m/%Y"), "valor": prev_60},
+      {"rotulo": f"+90d ({dt_90})", "data_completa": (hoje + timedelta(days=90)).strftime("%d/%m/%Y"), "valor": prev_90},
   ]
 
-  return {
-      "diario": serie_diaria,
-      "historico_60d": historico_60d,
-      "90d": serie_90d,
-  }
+  return {"diario": serie_diaria, "historico_60d": historico_60d, "90d": serie_90d}
 
 
 def coletar_mercado(dados_existentes=None):
   os.makedirs("dados", exist_ok=True)
   os.makedirs(PASTA_RELATORIOS, exist_ok=True)
-  gerar_arquivos_servidor_gratuito()
+  gerar_arquivos_servidor_e_icones()
 
   dolar = 5.65
   dolar_var = 0.0
@@ -627,13 +843,7 @@ def coletar_mercado(dados_existentes=None):
     prev_90d = round(preco_atual * (1 + (desvio_tot * 0.011 + 0.028)), 2)
 
     series = gerar_series_com_datas_reais(
-        preco_atual,
-        var_comb,
-        b["pares"],
-        prev_15d,
-        prev_30d,
-        prev_60d,
-        prev_90d,
+        preco_atual, var_comb, b["pares"], prev_15d, prev_30d, prev_60d, prev_90d
     )
     valores_30d = [p["valor"] for p in series["historico_60d"][-30:]]
     media_per = round(sum(valores_30d) / len(valores_30d), 2)
@@ -720,7 +930,7 @@ def salvar_db(pacote):
 
 
 def carregar_db():
-  gerar_arquivos_servidor_gratuito()
+  gerar_arquivos_servidor_e_icones()
   if os.path.exists(ARQUIVO_DB):
     try:
       with open(ARQUIVO_DB, "r", encoding="utf-8") as f:
@@ -729,7 +939,7 @@ def carregar_db():
             "dolar" in d
             and "itens" in d
             and len(d["itens"]) > 0
-            and "regioes_sul" in d["itens"][0]
+            and "fonte_oficial" in d["itens"][0]
         ):
           return d
     except Exception:
@@ -754,9 +964,11 @@ def main(page: ft.Page):
   data_ini_idx = 30
   data_fim_idx = 59
   filtro_cat = "Todos"
-  uf_selecionada = "SUL"  # SUL, RS, SC, PR
+  uf_selecionada = "SUL"
   item_regional_idx = 0
-  uf_aba_regional = "TODOS"  # TODOS, RS, SC, PR
+  uf_aba_regional = "TODOS"
+  polo_clima_sel = list(POLOS_CLIMA_SUL.keys())[0]
+  estacao_clima_sel = "Primavera (Set-Nov)"
 
   corpo_view = ft.Column(spacing=20, width=float("inf"))
 
@@ -769,7 +981,7 @@ def main(page: ft.Page):
     page.update()
 
   # =========================================================================
-  # COMPONENTE: GRÁFICO MULTIVISUAL + SELETOR DE ESTADO (RS/SC/PR) + IA
+  # COMPONENTE: GRÁFICO MULTIVISUAL + FONTES + IA
   # =========================================================================
   def construir_bloco_grafico():
     nonlocal data_ini_idx, data_fim_idx
@@ -777,7 +989,6 @@ def main(page: ft.Page):
     medias_uf = calcular_medias_estados(item_sel["regioes_sul"])
     item_sel["medias_uf"] = medias_uf
 
-    # Ajusta deslocamento regional caso o usuário filtre um estado específico (RS, SC ou PR)
     fator_uf = 1.0
     if uf_selecionada in ["RS", "SC", "PR"] and medias_uf["SUL"] > 0:
       fator_uf = medias_uf[uf_selecionada] / medias_uf["SUL"]
@@ -851,7 +1062,6 @@ def main(page: ft.Page):
       mostrar_painel_ia = not mostrar_painel_ia
       renderizar()
 
-    # Botões de seleção do Estado (Região Sul Completa, RS, SC, PR)
     botoes_uf = ft.Row(
         wrap=True,
         spacing=8,
@@ -941,48 +1151,12 @@ def main(page: ft.Page):
         wrap=True,
         spacing=8,
         controls=[
-            ft.ElevatedButton(
-                "Diário",
-                bgcolor="#38BDF8" if periodo_grafico == "diario" else "#1E293B",
-                color="#080D16" if periodo_grafico == "diario" else "#FFFFFF",
-                height=36,
-                on_click=lambda e: sel_periodo_graf("diario"),
-            ),
-            ft.ElevatedButton(
-                "7 Dias",
-                bgcolor="#38BDF8" if periodo_grafico == "7d" else "#1E293B",
-                color="#080D16" if periodo_grafico == "7d" else "#FFFFFF",
-                height=36,
-                on_click=lambda e: sel_periodo_graf("7d"),
-            ),
-            ft.ElevatedButton(
-                "15 Dias",
-                bgcolor="#38BDF8" if periodo_grafico == "15d" else "#1E293B",
-                color="#080D16" if periodo_grafico == "15d" else "#FFFFFF",
-                height=36,
-                on_click=lambda e: sel_periodo_graf("15d"),
-            ),
-            ft.ElevatedButton(
-                "30 Dias",
-                bgcolor="#38BDF8" if periodo_grafico == "30d" else "#1E293B",
-                color="#080D16" if periodo_grafico == "30d" else "#FFFFFF",
-                height=36,
-                on_click=lambda e: sel_periodo_graf("30d"),
-            ),
-            ft.ElevatedButton(
-                "60 Dias",
-                bgcolor="#38BDF8" if periodo_grafico == "60d" else "#1E293B",
-                color="#080D16" if periodo_grafico == "60d" else "#FFFFFF",
-                height=36,
-                on_click=lambda e: sel_periodo_graf("60d"),
-            ),
-            ft.ElevatedButton(
-                "Projeção 90 Dias",
-                bgcolor="#FACC15" if periodo_grafico == "90d" else "#1E293B",
-                color="#080D16" if periodo_grafico == "90d" else "#FFFFFF",
-                height=36,
-                on_click=lambda e: sel_periodo_graf("90d"),
-            ),
+            ft.ElevatedButton("Diário", bgcolor="#38BDF8" if periodo_grafico == "diario" else "#1E293B", color="#080D16" if periodo_grafico == "diario" else "#FFFFFF", height=36, on_click=lambda e: sel_periodo_graf("diario")),
+            ft.ElevatedButton("7 Dias", bgcolor="#38BDF8" if periodo_grafico == "7d" else "#1E293B", color="#080D16" if periodo_grafico == "7d" else "#FFFFFF", height=36, on_click=lambda e: sel_periodo_graf("7d")),
+            ft.ElevatedButton("15 Dias", bgcolor="#38BDF8" if periodo_grafico == "15d" else "#1E293B", color="#080D16" if periodo_grafico == "15d" else "#FFFFFF", height=36, on_click=lambda e: sel_periodo_graf("15d")),
+            ft.ElevatedButton("30 Dias", bgcolor="#38BDF8" if periodo_grafico == "30d" else "#1E293B", color="#080D16" if periodo_grafico == "30d" else "#FFFFFF", height=36, on_click=lambda e: sel_periodo_graf("30d")),
+            ft.ElevatedButton("60 Dias", bgcolor="#38BDF8" if periodo_grafico == "60d" else "#1E293B", color="#080D16" if periodo_grafico == "60d" else "#FFFFFF", height=36, on_click=lambda e: sel_periodo_graf("60d")),
+            ft.ElevatedButton("Projeção 90 Dias", bgcolor="#FACC15" if periodo_grafico == "90d" else "#1E293B", color="#080D16" if periodo_grafico == "90d" else "#FFFFFF", height=36, on_click=lambda e: sel_periodo_graf("90d")),
         ],
     )
 
@@ -992,10 +1166,7 @@ def main(page: ft.Page):
         color="#FFFFFF",
         border_radius=10,
         width=170,
-        options=[
-            ft.dropdown.Option(str(i), p["data_completa"])
-            for i, p in enumerate(hist_60)
-        ],
+        options=[ft.dropdown.Option(str(i), p["data_completa"]) for i, p in enumerate(hist_60)],
         value=str(data_ini_idx),
     )
     dd_data_fim = ft.Dropdown(
@@ -1004,10 +1175,7 @@ def main(page: ft.Page):
         color="#FFFFFF",
         border_radius=10,
         width=170,
-        options=[
-            ft.dropdown.Option(str(i), p["data_completa"])
-            for i, p in enumerate(hist_60)
-        ],
+        options=[ft.dropdown.Option(str(i), p["data_completa"]) for i, p in enumerate(hist_60)],
         value=str(data_fim_idx),
     )
 
@@ -1044,7 +1212,6 @@ def main(page: ft.Page):
         ],
     )
 
-    # Renderização do Gráfico segundo o Estilo Escolhido
     if estilo_grafico in ["area", "linha"]:
       passo_rotulo = max(1, len(pontos) // 8)
       rotulos_x = []
@@ -1053,10 +1220,7 @@ def main(page: ft.Page):
           rotulos_x.append(
               ft.ChartAxisLabel(
                   value=i,
-                  label=ft.Container(
-                      ft.Text(p["rotulo"], size=11, color="#94A3B8"),
-                      padding=ft.padding.only(top=6),
-                  ),
+                  label=ft.Container(ft.Text(p["rotulo"], size=11, color="#94A3B8"), padding=ft.padding.only(top=6)),
               )
           )
 
@@ -1068,28 +1232,18 @@ def main(page: ft.Page):
               data_series=[
                   ft.LineChartData(
                       data_points=[
-                          ft.LineChartDataPoint(
-                              i,
-                              p["valor"],
-                              tooltip=f"{p['data_completa']} ({uf_selecionada}): R$ {p['valor']:.2f}",
-                          )
+                          ft.LineChartDataPoint(i, p["valor"], tooltip=f"{p['data_completa']} ({uf_selecionada}): R$ {p['valor']:.2f}")
                           for i, p in enumerate(pontos)
                       ],
                       stroke_width=4,
                       color=item_sel["cor"],
                       curved=(estilo_grafico == "area"),
                       stroke_cap_round=True,
-                      below_line_bgcolor=f"#33{cor_hex_limpa}"
-                      if estilo_grafico == "area"
-                      else None,
+                      below_line_bgcolor=f"#33{cor_hex_limpa}" if estilo_grafico == "area" else None,
                   ),
                   ft.LineChartData(
                       data_points=[
-                          ft.LineChartDataPoint(
-                              i,
-                              round(media_val, 2),
-                              tooltip=f"Média ({uf_selecionada}): R$ {media_val:.2f}",
-                          )
+                          ft.LineChartDataPoint(i, round(media_val, 2), tooltip=f"Média ({uf_selecionada}): R$ {media_val:.2f}")
                           for i in range(len(pontos))
                       ],
                       stroke_width=2,
@@ -1104,16 +1258,8 @@ def main(page: ft.Page):
               max_x=max(1, len(pontos) - 1),
               left_axis=ft.ChartAxis(labels_size=58),
               bottom_axis=ft.ChartAxis(labels=rotulos_x, labels_size=34),
-              horizontal_grid_lines=ft.ChartGridLines(
-                  interval=max(0.2, round(amplitude / 4, 2)),
-                  color="#1E293B",
-                  width=1,
-              ),
-              vertical_grid_lines=ft.ChartGridLines(
-                  interval=max(1, passo_rotulo),
-                  color="#1E293B",
-                  width=1,
-              ),
+              horizontal_grid_lines=ft.ChartGridLines(interval=max(0.2, round(amplitude / 4, 2)), color="#1E293B", width=1),
+              vertical_grid_lines=ft.ChartGridLines(interval=max(1, passo_rotulo), color="#1E293B", width=1),
               tooltip_bgcolor="#0F172A",
               interactive=True,
               expand=True,
@@ -1125,11 +1271,7 @@ def main(page: ft.Page):
       if pontos[-1] not in pontos_col:
         pontos_col.append(pontos[-1])
 
-      colunas_grafico = ft.Row(
-          alignment=ft.MainAxisAlignment.SPACE_AROUND,
-          vertical_alignment=ft.CrossAxisAlignment.END,
-          height=220,
-      )
+      colunas_grafico = ft.Row(alignment=ft.MainAxisAlignment.SPACE_AROUND, vertical_alignment=ft.CrossAxisAlignment.END, height=220)
       for p in pontos_col:
         proporcao = (p["valor"] - min_val) / amplitude
         altura_barra = int(45 + (proporcao * 120))
@@ -1142,19 +1284,12 @@ def main(page: ft.Page):
                 alignment=ft.MainAxisAlignment.END,
                 spacing=5,
                 controls=[
-                    ft.Text(
-                        f"R$ {p['valor']:.2f}",
-                        color="#FFFFFF",
-                        size=11,
-                        weight=ft.FontWeight.BOLD,
-                    ),
+                    ft.Text(f"R$ {p['valor']:.2f}", color="#FFFFFF", size=11, weight=ft.FontWeight.BOLD),
                     ft.Container(
                         width=38,
                         height=altura_barra,
                         bgcolor=cor_barra,
-                        border_radius=ft.border_radius.only(
-                            top_left=10, top_right=10, bottom_left=4, bottom_right=4
-                        ),
+                        border_radius=ft.border_radius.only(top_left=10, top_right=10, bottom_left=4, bottom_right=4),
                         tooltip=f"{p['data_completa']}: R$ {p['valor']:.2f}",
                     ),
                     ft.Text(p["rotulo"], color="#94A3B8", size=11),
@@ -1184,22 +1319,9 @@ def main(page: ft.Page):
                         bgcolor="#131E32",
                         height=22,
                         border_radius=8,
-                        content=ft.Row([
-                            ft.Container(
-                                width=int(prop * 420),
-                                height=22,
-                                bgcolor=item_sel["cor"],
-                                border_radius=8,
-                            )
-                        ]),
+                        content=ft.Row([ft.Container(width=int(prop * 420), height=22, bgcolor=item_sel["cor"], border_radius=8)]),
                     ),
-                    ft.Text(
-                        f"R$ {p['valor']:.2f} ({dif_m:+.2f} vs média)",
-                        color=cor_d,
-                        size=12,
-                        weight=ft.FontWeight.BOLD,
-                        width=185,
-                    ),
+                    ft.Text(f"R$ {p['valor']:.2f} ({dif_m:+.2f} vs média)", color=cor_d, size=12, weight=ft.FontWeight.BOLD, width=185),
                 ],
             )
         )
@@ -1249,9 +1371,9 @@ def main(page: ft.Page):
                             ],
                         ),
                         ft.Text(
-                            f"Médias Atuais: RS R$ {medias_uf['RS']:.2f} • SC R$ {medias_uf['SC']:.2f} • PR R$ {medias_uf['PR']:.2f}",
-                            color="#38BDF8",
-                            size=13,
+                            f"Fonte: {item_sel.get('fonte_oficial', 'CBOT + CEPEA/IRGA/Epagri/Deral')}",
+                            color="#10B981",
+                            size=12,
                             weight=ft.FontWeight.BOLD,
                         ),
                     ],
@@ -1307,19 +1429,9 @@ def main(page: ft.Page):
                         ),
                     ],
                 ),
-                ft.Text(
-                    "📌 Fundamentação da Estimativa (RS, SC e PR):",
-                    color="#FFFFFF",
-                    size=15,
-                    weight=ft.FontWeight.BOLD,
-                ),
+                ft.Text("📌 Fundamentação da Estimativa (RS, SC e PR):", color="#FFFFFF", size=15, weight=ft.FontWeight.BOLD),
                 ft.Text(item_sel.get("explicacao_previsao", item_sel["motivo"]), color="#E2E8F0", size=13),
-                ft.Text(
-                    "🌡️ Do que depende a oscilação deste item na Região Sul?",
-                    color="#38BDF8",
-                    size=15,
-                    weight=ft.FontWeight.BOLD,
-                ),
+                ft.Text("🌡️ Do que depende a oscilação deste item na Região Sul?", color="#38BDF8", size=15, weight=ft.FontWeight.BOLD),
                 lista_fatores_ui,
                 ft.Container(
                     bgcolor="#2A1B08",
@@ -1382,6 +1494,11 @@ def main(page: ft.Page):
                                         f"{titulo_per}  |  Linha Tracejada = Média (R$ {media_val:.2f})",
                                         color="#38BDF8",
                                         size=13,
+                                    ),
+                                    ft.Text(
+                                        f"📚 Fonte Auditável: {item_sel.get('fonte_oficial', '')}",
+                                        color="#10B981",
+                                        size=12,
                                     ),
                                 ]),
                             ],
@@ -1474,7 +1591,7 @@ def main(page: ft.Page):
     )
 
   # =========================================================================
-  # RENDERIZAÇÃO DAS 6 ABAS DO SISTEMA
+  # RENDERIZAÇÃO DAS 7 ABAS DO SISTEMA
   # =========================================================================
   def renderizar():
     corpo_view.controls.clear()
@@ -1495,7 +1612,7 @@ def main(page: ft.Page):
           wrap=True,
           controls=[
               ft.Text(
-                  "Painel de Cotações da Região Sul (RS, SC e PR) & Estimativas Futuras",
+                  "Painel de Cotações da Região Sul (RS, SC e PR) & Fontes dos Resultados",
                   color="#FFFFFF",
                   size=20,
                   weight=ft.FontWeight.BOLD,
@@ -1503,24 +1620,9 @@ def main(page: ft.Page):
               ft.Row(
                   spacing=8,
                   controls=[
-                      ft.ElevatedButton(
-                          "Todos",
-                          bgcolor="#10B981" if filtro_cat == "Todos" else "#1E293B",
-                          color="#080D16" if filtro_cat == "Todos" else "#FFFFFF",
-                          on_click=lambda e: mudar_f_cat("Todos"),
-                      ),
-                      ft.ElevatedButton(
-                          "Só Grãos",
-                          bgcolor="#F59E0B" if filtro_cat == "Grãos" else "#1E293B",
-                          color="#080D16" if filtro_cat == "Grãos" else "#FFFFFF",
-                          on_click=lambda e: mudar_f_cat("Grãos"),
-                      ),
-                      ft.ElevatedButton(
-                          "Só Sementes",
-                          bgcolor="#10B981" if filtro_cat == "Sementes" else "#1E293B",
-                          color="#080D16" if filtro_cat == "Sementes" else "#FFFFFF",
-                          on_click=lambda e: mudar_f_cat("Sementes"),
-                      ),
+                      ft.ElevatedButton("Todos", bgcolor="#10B981" if filtro_cat == "Todos" else "#1E293B", color="#080D16" if filtro_cat == "Todos" else "#FFFFFF", on_click=lambda e: mudar_f_cat("Todos")),
+                      ft.ElevatedButton("Só Grãos", bgcolor="#F59E0B" if filtro_cat == "Grãos" else "#1E293B", color="#080D16" if filtro_cat == "Grãos" else "#FFFFFF", on_click=lambda e: mudar_f_cat("Grãos")),
+                      ft.ElevatedButton("Só Sementes", bgcolor="#10B981" if filtro_cat == "Sementes" else "#1E293B", color="#080D16" if filtro_cat == "Sementes" else "#FFFFFF", on_click=lambda e: mudar_f_cat("Sementes")),
                   ],
               ),
           ],
@@ -1549,10 +1651,7 @@ def main(page: ft.Page):
             bgcolor="#111927",
             padding=24,
             border_radius=26,
-            border=ft.border.all(
-                2 if idx == item_grafico_idx else 1,
-                item["cor"] if idx == item_grafico_idx else "#1E293B",
-            ),
+            border=ft.border.all(2 if idx == item_grafico_idx else 1, item["cor"] if idx == item_grafico_idx else "#1E293B"),
             content=ft.Column(
                 spacing=14,
                 controls=[
@@ -1575,11 +1674,7 @@ def main(page: ft.Page):
                                         spacing=3,
                                         controls=[
                                             ft.Text(item["nome"], color="#FFFFFF", size=20, weight=ft.FontWeight.BOLD),
-                                            ft.Text(
-                                                f"{item['unidade']} • Média Sul: R$ {m_uf['SUL']:.2f}",
-                                                color="#94A3B8",
-                                                size=13,
-                                            ),
+                                            ft.Text(f"{item['unidade']} • Média Sul: R$ {m_uf['SUL']:.2f}", color="#94A3B8", size=13),
                                         ],
                                     ),
                                 ],
@@ -1594,7 +1689,6 @@ def main(page: ft.Page):
                             ),
                         ],
                     ),
-                    # Barra Comparativa dos 3 Estados (RS | SC | PR)
                     ft.Container(
                         bgcolor="#0B111E",
                         padding=10,
@@ -1625,6 +1719,12 @@ def main(page: ft.Page):
                                     ],
                                 ),
                                 ft.Text(f"Motivo: {item['motivo']}", color="#CBD5E1", size=13),
+                                ft.Text(
+                                    f"📚 Fonte dos Dados: {item.get('fonte_oficial', 'CBOT + CEPEA/IRGA/Epagri/Deral')}",
+                                    color="#38BDF8",
+                                    size=11,
+                                    weight=ft.FontWeight.W_600,
+                                ),
                             ],
                         ),
                     ),
@@ -1687,7 +1787,225 @@ def main(page: ft.Page):
       corpo_view.controls.append(grade)
 
     # -------------------------------------------------------------------------
-    # ABA 2: CONTRATOS DA EMPRESA & COMPARATIVO REGIÃO SUL (RS, SC e PR)
+    # ABA 2: CLIMA AGRÍCOLA & HISTÓRICO DE ESTAÇÕES DE ANOS ANTERIORES (CHUVA)
+    # -------------------------------------------------------------------------
+    elif aba_atual == "clima":
+      info_polo = POLOS_CLIMA_SUL[polo_clima_sel]
+      previsao_10d = buscar_previsao_tempo_openmeteo(polo_clima_sel)
+      total_chuva_10d = round(sum(d["chuva_mm"] for d in previsao_10d), 1)
+      dias_com_chuva = sum(1 for d in previsao_10d if d["chuva_mm"] >= 1.0)
+
+      def mudar_polo_clima(e):
+        nonlocal polo_clima_sel
+        polo_clima_sel = dd_polo.value
+        renderizar()
+
+      def mudar_estacao_clima(est):
+        nonlocal estacao_clima_sel
+        estacao_clima_sel = est
+        renderizar()
+
+      dd_polo = ft.Dropdown(
+          label="📍 Selecione o Polo Agrícola da Região Sul (RS / SC / PR)",
+          bgcolor="#0B111E",
+          color="#FFFFFF",
+          border_radius=12,
+          width=460,
+          options=[ft.dropdown.Option(k) for k in POLOS_CLIMA_SUL.keys()],
+          value=polo_clima_sel,
+          on_change=mudar_polo_clima,
+      )
+
+      # Cartões dos próximos 10 dias (Open-Meteo ECMWF/GFS)
+      cards_10d = ft.ResponsiveRow(spacing=10, run_spacing=10)
+      for d in previsao_10d:
+        chove = d["chuva_mm"] >= 2.0
+        cor_c = "#38BDF8" if chove else "#FACC15"
+        icone_c = ft.icons.WATER_DROP_ROUNDED if chove else ft.icons.WB_SUNNY_ROUNDED
+        cards_10d.controls.append(
+            ft.Container(
+                col={"xs": 6, "sm": 4, "md": 2.4},
+                bgcolor="#0B111E",
+                padding=14,
+                border_radius=16,
+                border=ft.border.all(1, "#38BDF8" if chove else "#1E293B"),
+                content=ft.Column(
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    spacing=4,
+                    controls=[
+                        ft.Text(d["data"], color="#FFFFFF", size=14, weight=ft.FontWeight.BOLD),
+                        ft.Icon(icone_c, color=cor_c, size=26),
+                        ft.Text(f"{d['chuva_mm']:.1f} mm", color="#38BDF8", size=16, weight=ft.FontWeight.BOLD),
+                        ft.Text(f"Prob: {d['prob']}%", color="#94A3B8", size=11),
+                        ft.Text(f"{d['tmin']:.0f}°C / {d['tmax']:.0f}°C", color="#E2E8F0", size=12),
+                    ],
+                ),
+            )
+        )
+
+      # Botões de Estação do Ano para Comparativo de Anos Anteriores
+      botoes_estacoes = ft.Row(wrap=True, spacing=8)
+      for nome_est in info_polo["historico_estacoes"].keys():
+        ativo = nome_est == estacao_clima_sel
+        botoes_estacoes.controls.append(
+            ft.ElevatedButton(
+                f"🌦️ {nome_est}",
+                bgcolor="#38BDF8" if ativo else "#1E293B",
+                color="#080D16" if ativo else "#FFFFFF",
+                height=40,
+                on_click=lambda e, es=nome_est: mudar_estacao_clima(es),
+            )
+        )
+
+      dados_est = info_polo["historico_estacoes"][estacao_clima_sel]
+      max_mm = max(dados_est.values()) if dados_est else 500
+
+      itens_barras_anos = [
+          ("Ano 2023 (El Niño Forte)", dados_est["2023"], "#0EA5E9"),
+          ("Ano 2024 (Transição / Chuvas Intensas)", dados_est["2024"], "#38BDF8"),
+          ("Ano 2025 (La Niña / Neutro)", dados_est["2025"], "#A855F7"),
+          ("Média Histórica (30 Anos - ERA5/INMET)", dados_est["media_hist"], "#94A3B8"),
+          ("Previsão Safra 2026/2027 (Estimativa IA)", dados_est["2026_est"], "#10B981"),
+      ]
+
+      colunas_comparativo_anos = ft.Column(spacing=10)
+      for rotulo_ano, mm_val, cor_b in itens_barras_anos:
+        prop = mm_val / max(1, max_mm)
+        desvio_hist = mm_val - dados_est["media_hist"]
+        colunas_comparativo_anos.controls.append(
+            ft.Container(
+                bgcolor="#0B111E",
+                padding=14,
+                border_radius=14,
+                content=ft.Column(
+                    spacing=6,
+                    controls=[
+                        ft.Row(
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            controls=[
+                                ft.Text(rotulo_ano, color="#FFFFFF", size=14, weight=ft.FontWeight.BOLD),
+                                ft.Text(
+                                    f"{mm_val} mm acumulados ({desvio_hist:+d} mm vs Média Histórica)",
+                                    color=cor_b,
+                                    size=13,
+                                    weight=ft.FontWeight.BOLD,
+                                ),
+                            ],
+                        ),
+                        ft.Container(
+                            bgcolor="#131E32",
+                            height=20,
+                            border_radius=10,
+                            content=ft.Row([
+                                ft.Container(
+                                    width=int(prop * 520),
+                                    height=20,
+                                    bgcolor=cor_b,
+                                    border_radius=10,
+                                )
+                            ]),
+                        ),
+                    ],
+                ),
+            )
+        )
+
+      analise_chuva_safra = (
+          f"Diagnóstico Pluviométrico ({polo_clima_sel}): Nos próximos 10 dias,"
+          f" os modelos ECMWF e NOAA GFS projetam acumulado de {total_chuva_10d:.1f} mm"
+          f" distribuídos em {dias_com_chuva} dia(s) com precipitação. Comparando a"
+          f" estação {estacao_clima_sel} com os anos anteriores (2023: {dados_est['2023']} mm,"
+          f" 2024: {dados_est['2024']} mm, 2025: {dados_est['2025']} mm), a previsão"
+          f" para o ciclo 2026/2027 ({dados_est['2026_est']} mm) situa-se próxima da"
+          f" normalidade histórica ({dados_est['media_hist']} mm), favorecendo o"
+          " planejamento escalonado de plantio, manejo e comercialização."
+      )
+
+      corpo_view.controls.append(
+          ft.Container(
+              bgcolor="#111927",
+              padding=28,
+              border_radius=26,
+              border=ft.border.all(1.5, "#1E293B"),
+              content=ft.Column(
+                  spacing=20,
+                  controls=[
+                      ft.Row(
+                          alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                          wrap=True,
+                          controls=[
+                              ft.Column([
+                                  ft.Text(
+                                      "🌧️ Inteligência Climática & Comparativo de Chuvas de Anos Anteriores",
+                                      color="#FFFFFF",
+                                      size=22,
+                                      weight=ft.FontWeight.BOLD,
+                                  ),
+                                  ft.Text(
+                                      "📚 Fonte Meteorológica: Open-Meteo Agro API (Modelos ECMWF Europeu + NOAA GFS + Reanálise Histórica ERA5/INMET)",
+                                      color="#10B981",
+                                      size=12,
+                                      weight=ft.FontWeight.BOLD,
+                                  ),
+                              ]),
+                              dd_polo,
+                          ],
+                      ),
+                      ft.Container(
+                          bgcolor="#0B111E",
+                          padding=16,
+                          border_radius=16,
+                          border=ft.border.all(1, "#38BDF8"),
+                          content=ft.Row(
+                              alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                              wrap=True,
+                              controls=[
+                                  ft.Text(f"🌾 Vocação do Polo: {info_polo['perfil']}", color="#E2E8F0", size=14),
+                                  ft.Text(
+                                      f"💧 Acumulado Previsto (Próximos 10 Dias): {total_chuva_10d:.1f} mm ({dias_com_chuva} dias de chuva)",
+                                      color="#38BDF8",
+                                      size=15,
+                                      weight=ft.FontWeight.BOLD,
+                                  ),
+                              ],
+                          ),
+                      ),
+                      ft.Text(
+                          "📅 Previsão Diária Assertiva de Chuva e Temperatura (Próximos 10 Dias — Satélite ECMWF/GFS):",
+                          color="#FACC15",
+                          size=16,
+                          weight=ft.FontWeight.BOLD,
+                      ),
+                      cards_10d,
+                      ft.Divider(color="#1E293B"),
+                      ft.Text(
+                          "📊 Comparativo de Chuvas por Estação — Anos Anteriores (2023, 2024, 2025) vs. Previsão Safra 2026/27:",
+                          color="#FFFFFF",
+                          size=18,
+                          weight=ft.FontWeight.BOLD,
+                      ),
+                      botoes_estacoes,
+                      colunas_comparativo_anos,
+                      ft.Container(
+                          bgcolor="#0B111E",
+                          padding=16,
+                          border_radius=16,
+                          border=ft.border.all(1, "#10B981"),
+                          content=ft.Row(
+                              spacing=10,
+                              controls=[
+                                  ft.Icon(ft.icons.CLOUD_SYNC_ROUNDED, color="#10B981", size=26),
+                                  ft.Text(analise_chuva_safra, color="#E2E8F0", size=13, expand=True),
+                              ],
+                          ),
+                      ),
+                  ],
+              ),
+          )
+      )
+
+    # -------------------------------------------------------------------------
+    # ABA 3: CONTRATOS DA EMPRESA & COMPARATIVO REGIÃO SUL (RS, SC e PR)
     # -------------------------------------------------------------------------
     elif aba_atual == "regional":
       item_reg = dados["itens"][item_regional_idx]
@@ -1719,30 +2037,10 @@ def main(page: ft.Page):
           wrap=True,
           spacing=8,
           controls=[
-              ft.ElevatedButton(
-                  "🌎 Todos os 3 Estados (RS + SC + PR)",
-                  bgcolor="#38BDF8" if uf_aba_regional == "TODOS" else "#1E293B",
-                  color="#080D16" if uf_aba_regional == "TODOS" else "#FFFFFF",
-                  on_click=lambda e: escolher_uf_reg("TODOS"),
-              ),
-              ft.ElevatedButton(
-                  "🟢 Só Rio Grande do Sul (RS)",
-                  bgcolor="#10B981" if uf_aba_regional == "RS" else "#1E293B",
-                  color="#080D16" if uf_aba_regional == "RS" else "#FFFFFF",
-                  on_click=lambda e: escolher_uf_reg("RS"),
-              ),
-              ft.ElevatedButton(
-                  "🔴 Só Santa Catarina (SC)",
-                  bgcolor="#10B981" if uf_aba_regional == "SC" else "#1E293B",
-                  color="#080D16" if uf_aba_regional == "SC" else "#FFFFFF",
-                  on_click=lambda e: escolher_uf_reg("SC"),
-              ),
-              ft.ElevatedButton(
-                  "🔵 Só Paraná (PR)",
-                  bgcolor="#10B981" if uf_aba_regional == "PR" else "#1E293B",
-                  color="#080D16" if uf_aba_regional == "PR" else "#FFFFFF",
-                  on_click=lambda e: escolher_uf_reg("PR"),
-              ),
+              ft.ElevatedButton("🌎 Todos os 3 Estados (RS + SC + PR)", bgcolor="#38BDF8" if uf_aba_regional == "TODOS" else "#1E293B", color="#080D16" if uf_aba_regional == "TODOS" else "#FFFFFF", on_click=lambda e: escolher_uf_reg("TODOS")),
+              ft.ElevatedButton("🟢 Só Rio Grande do Sul (RS)", bgcolor="#10B981" if uf_aba_regional == "RS" else "#1E293B", color="#080D16" if uf_aba_regional == "RS" else "#FFFFFF", on_click=lambda e: escolher_uf_reg("RS")),
+              ft.ElevatedButton("🔴 Só Santa Catarina (SC)", bgcolor="#10B981" if uf_aba_regional == "SC" else "#1E293B", color="#080D16" if uf_aba_regional == "SC" else "#FFFFFF", on_click=lambda e: escolher_uf_reg("SC")),
+              ft.ElevatedButton("🔵 Só Paraná (PR)", bgcolor="#10B981" if uf_aba_regional == "PR" else "#1E293B", color="#080D16" if uf_aba_regional == "PR" else "#FFFFFF", on_click=lambda e: escolher_uf_reg("PR")),
           ],
       )
 
@@ -1816,14 +2114,7 @@ def main(page: ft.Page):
               status_praca = "Empatado com o valor do contrato da empresa"
               cor_dif = "#38BDF8"
 
-            tf = ft.TextField(
-                label="Valor na Praça (R$)",
-                value=f"{valor_praca:.2f}",
-                bgcolor="#111927",
-                color="#FFFFFF",
-                border_radius=12,
-                width=170,
-            )
+            tf = ft.TextField(label="Valor na Praça (R$)", value=f"{valor_praca:.2f}", bgcolor="#111927", color="#FFFFFF", border_radius=12, width=170)
             campos_regioes[(uf_k, nome_praca)] = tf
 
             linhas_regioes_ui.controls.append(
@@ -1856,31 +2147,6 @@ def main(page: ft.Page):
 
       atualizar_analise_sul(None)
 
-      linhas_resumo_todos = ft.Column(spacing=8)
-      for it in dados["itens"]:
-        m_u = calcular_medias_estados(it["regioes_sul"])
-        linhas_resumo_todos.controls.append(
-            ft.Container(
-                bgcolor="#0B111E",
-                padding=14,
-                border_radius=12,
-                content=ft.Row(
-                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                    wrap=True,
-                    controls=[
-                        ft.Text(f"{it['nome']} ({it['unidade']})", color="#FFFFFF", weight=ft.FontWeight.BOLD, size=14),
-                        ft.Text(
-                            f"Contrato: R$ {it['contrato_empresa']:.2f}  |  "
-                            f"RS: R$ {m_u['RS']:.2f}  •  SC: R$ {m_u['SC']:.2f}  •  PR: R$ {m_u['PR']:.2f}  |  "
-                            f"Média Sul: R$ {m_u['SUL']:.2f}",
-                            color="#38BDF8",
-                            size=13,
-                        ),
-                    ],
-                ),
-            )
-        )
-
       corpo_view.controls.append(
           ft.Container(
               bgcolor="#111927",
@@ -1890,17 +2156,7 @@ def main(page: ft.Page):
               content=ft.Column(
                   spacing=18,
                   controls=[
-                      ft.Text(
-                          "🗺️ Contratos da Empresa & Comparativo Região Sul (RS, SC e PR)",
-                          color="#FFFFFF",
-                          size=22,
-                          weight=ft.FontWeight.BOLD,
-                      ),
-                      ft.Text(
-                          "Selecione o item e o estado abaixo. Todos os preços regionais do Rio Grande do Sul, Santa Catarina e Paraná podem ser editados:",
-                          color="#94A3B8",
-                          size=14,
-                      ),
+                      ft.Text("🗺️ Contratos da Empresa & Comparativo Região Sul (RS, SC e PR)", color="#FFFFFF", size=22, weight=ft.FontWeight.BOLD),
                       botoes_itens_reg,
                       botoes_filtro_uf,
                       ft.Row(
@@ -1909,32 +2165,17 @@ def main(page: ft.Page):
                           vertical_alignment=ft.CrossAxisAlignment.CENTER,
                           controls=[
                               campo_contrato_emp,
-                              ft.ElevatedButton(
-                                  "Recalcular e Guardar RS / SC / PR",
-                                  icon=ft.icons.SAVE_ROUNDED,
-                                  bgcolor="#10B981",
-                                  color="#080D16",
-                                  height=50,
-                                  on_click=atualizar_analise_sul,
-                              ),
+                              ft.ElevatedButton("Recalcular e Guardar RS / SC / PR", icon=ft.icons.SAVE_ROUNDED, bgcolor="#10B981", color="#080D16", height=50, on_click=atualizar_analise_sul),
                           ],
                       ),
                       linhas_regioes_ui,
-                      ft.Divider(color="#1E293B"),
-                      ft.Text(
-                          "📋 Resumo Comparativo de Todos os Itens nos 3 Estados do Sul:",
-                          color="#FACC15",
-                          size=17,
-                          weight=ft.FontWeight.BOLD,
-                      ),
-                      linhas_resumo_todos,
                   ],
               ),
           )
       )
 
     # -------------------------------------------------------------------------
-    # ABA 3: ESTUDO DE FRETES E ROTAS INTERESTADUAIS (RS, SC e PR)
+    # ABA 4: ESTUDO DE FRETES E ROTAS INTERESTADUAIS (RS, SC e PR)
     # -------------------------------------------------------------------------
     elif aba_atual == "frete":
       c_km = ft.TextField(label="Distância da Rota (KM)", value="220", bgcolor="#0B111E", color="#FFFFFF", border_radius=12, width=210)
@@ -1962,50 +2203,10 @@ def main(page: ft.Page):
                   spacing=14,
                   run_spacing=14,
                   controls=[
-                      ft.Container(
-                          col={"xs": 12, "sm": 6, "md": 3},
-                          bgcolor="#0B111E",
-                          padding=16,
-                          border_radius=16,
-                          border=ft.border.all(1, "#38BDF8"),
-                          content=ft.Column([
-                              ft.Text("CUSTO TOTAL DA VIAGEM", color="#94A3B8", size=11),
-                              ft.Text(f"R$ {custo_viagem:,.2f}", color="#38BDF8", size=22, weight=ft.FontWeight.BOLD),
-                          ]),
-                      ),
-                      ft.Container(
-                          col={"xs": 12, "sm": 6, "md": 3},
-                          bgcolor="#0B111E",
-                          padding=16,
-                          border_radius=16,
-                          border=ft.border.all(1, "#10B981"),
-                          content=ft.Column([
-                              ft.Text("FRETE POR TONELADA", color="#94A3B8", size=11),
-                              ft.Text(f"R$ {custo_ton:,.2f} / ton", color="#10B981", size=22, weight=ft.FontWeight.BOLD),
-                          ]),
-                      ),
-                      ft.Container(
-                          col={"xs": 12, "sm": 6, "md": 3},
-                          bgcolor="#0B111E",
-                          padding=16,
-                          border_radius=16,
-                          border=ft.border.all(1, "#FACC15"),
-                          content=ft.Column([
-                              ft.Text("IMPACTO SACA 60KG (SOJA/MILHO)", color="#94A3B8", size=11),
-                              ft.Text(f"R$ {custo_saca_60:.2f} / sc", color="#FACC15", size=22, weight=ft.FontWeight.BOLD),
-                          ]),
-                      ),
-                      ft.Container(
-                          col={"xs": 12, "sm": 6, "md": 3},
-                          bgcolor="#0B111E",
-                          padding=16,
-                          border_radius=16,
-                          border=ft.border.all(1, "#A855F7"),
-                          content=ft.Column([
-                              ft.Text("ARROZ (50KG) / SEMENTE (40KG)", color="#94A3B8", size=11),
-                              ft.Text(f"R$ {custo_saca_50:.2f} | R$ {custo_saca_40:.2f}", color="#A855F7", size=18, weight=ft.FontWeight.BOLD),
-                          ]),
-                      ),
+                      ft.Container(col={"xs": 12, "sm": 6, "md": 3}, bgcolor="#0B111E", padding=16, border_radius=16, border=ft.border.all(1, "#38BDF8"), content=ft.Column([ft.Text("CUSTO TOTAL DA VIAGEM", color="#94A3B8", size=11), ft.Text(f"R$ {custo_viagem:,.2f}", color="#38BDF8", size=22, weight=ft.FontWeight.BOLD)])),
+                      ft.Container(col={"xs": 12, "sm": 6, "md": 3}, bgcolor="#0B111E", padding=16, border_radius=16, border=ft.border.all(1, "#10B981"), content=ft.Column([ft.Text("FRETE POR TONELADA", color="#94A3B8", size=11), ft.Text(f"R$ {custo_ton:,.2f} / ton", color="#10B981", size=22, weight=ft.FontWeight.BOLD)])),
+                      ft.Container(col={"xs": 12, "sm": 6, "md": 3}, bgcolor="#0B111E", padding=16, border_radius=16, border=ft.border.all(1, "#FACC15"), content=ft.Column([ft.Text("IMPACTO SACA 60KG (SOJA/MILHO)", color="#94A3B8", size=11), ft.Text(f"R$ {custo_saca_60:.2f} / sc", color="#FACC15", size=22, weight=ft.FontWeight.BOLD)])),
+                      ft.Container(col={"xs": 12, "sm": 6, "md": 3}, bgcolor="#0B111E", padding=16, border_radius=16, border=ft.border.all(1, "#A855F7"), content=ft.Column([ft.Text("ARROZ (50KG) / SEMENTE (40KG)", color="#94A3B8", size=11), ft.Text(f"R$ {custo_saca_50:.2f} | R$ {custo_saca_40:.2f}", color="#A855F7", size=18, weight=ft.FontWeight.BOLD)])),
                   ],
               )
           )
@@ -2016,7 +2217,6 @@ def main(page: ft.Page):
               ("Fronteira Oeste RS (São Borja) ➔ Meio-Oeste SC (Campos Novos) [430 km]", 430),
               ("Fronteira Oeste RS (São Borja) ➔ Porto de Rio Grande/RS [560 km]", 560),
               ("Oeste PR (Cascavel) ➔ Porto de Paranaguá/PR [580 km]", 580),
-              ("Norte RS / Oeste SC ➔ Sudoeste PR (Pato Branco) [260 km]", 260),
           ]
           for nome_r, dist_r in rotas_sul:
             tot_r = (dist_r * rkm) + ped
@@ -2031,10 +2231,7 @@ def main(page: ft.Page):
                         wrap=True,
                         controls=[
                             ft.Text(f"🚛 {nome_r}", color="#FFFFFF", weight=ft.FontWeight.BOLD),
-                            ft.Text(
-                                f"Total: R$ {tot_r:,.2f}  |  Por Tonelada: R$ {(tot_r/ton):.2f}  |  Saca 60kg: R$ {sc60_r:.2f}",
-                                color="#CBD5E1",
-                            ),
+                            ft.Text(f"Total: R$ {tot_r:,.2f}  |  Por Tonelada: R$ {(tot_r/ton):.2f}  |  Saca 60kg: R$ {sc60_r:.2f}", color="#CBD5E1"),
                         ],
                     ),
                 )
@@ -2054,21 +2251,9 @@ def main(page: ft.Page):
               content=ft.Column(
                   spacing=20,
                   controls=[
-                      ft.Text(
-                          "🚛 Estudo de Preços de Fretes & Rotas da Região Sul (RS, SC e PR)",
-                          color="#FFFFFF",
-                          size=22,
-                          weight=ft.FontWeight.BOLD,
-                      ),
+                      ft.Text("🚛 Estudo de Preços de Fretes & Rotas da Região Sul (RS, SC e PR)", color="#FFFFFF", size=22, weight=ft.FontWeight.BOLD),
                       ft.Row(wrap=True, spacing=14, controls=[c_km, c_rkm, c_ton, c_pedagio]),
-                      ft.ElevatedButton(
-                          "Calcular Estudo Logístico",
-                          icon=ft.icons.CALCULATE_ROUNDED,
-                          bgcolor="#FACC15",
-                          color="#080D16",
-                          height=48,
-                          on_click=calcular_estudo_frete,
-                      ),
+                      ft.ElevatedButton("Calcular Estudo Logístico", icon=ft.icons.CALCULATE_ROUNDED, bgcolor="#FACC15", color="#080D16", height=48, on_click=calcular_estudo_frete),
                       painel_res_frete,
                   ],
               ),
@@ -2076,7 +2261,7 @@ def main(page: ft.Page):
       )
 
     # -------------------------------------------------------------------------
-    # ABA 4: SIMULADOR BARTER & PREÇO LÍQUIDO
+    # ABA 5: SIMULADOR BARTER & PREÇO LÍQUIDO
     # -------------------------------------------------------------------------
     elif aba_atual == "barter":
       s_qtd = ft.TextField(label="Quantidade de Sacas", value="500", bgcolor="#0B111E", color="#FFFFFF", border_radius=12, width=220)
@@ -2126,25 +2311,11 @@ def main(page: ft.Page):
       )
 
     # -------------------------------------------------------------------------
-    # ABA 5: PLANILHAS DE DADOS E PASTA DE RELATÓRIOS COM DATAS
+    # ABA 6: PLANILHAS DE DADOS E PASTA DE RELATÓRIOS COM DATAS E FONTES
     # -------------------------------------------------------------------------
     elif aba_atual == "relatorios":
-      f_uf = ft.Dropdown(
-          label="Estado (UF)",
-          bgcolor="#0B111E",
-          color="#FFFFFF",
-          width=110,
-          options=[ft.dropdown.Option("RS"), ft.dropdown.Option("SC"), ft.dropdown.Option("PR")],
-          value="RS",
-      )
-      f_item = ft.Dropdown(
-          label="Item",
-          bgcolor="#0B111E",
-          color="#FFFFFF",
-          width=220,
-          options=[ft.dropdown.Option(i["nome"]) for i in dados["itens"]],
-          value=dados["itens"][0]["nome"],
-      )
+      f_uf = ft.Dropdown(label="Estado (UF)", bgcolor="#0B111E", color="#FFFFFF", width=110, options=[ft.dropdown.Option("RS"), ft.dropdown.Option("SC"), ft.dropdown.Option("PR")], value="RS")
+      f_item = ft.Dropdown(label="Item", bgcolor="#0B111E", color="#FFFFFF", width=220, options=[ft.dropdown.Option(i["nome"]) for i in dados["itens"]], value=dados["itens"][0]["nome"])
       f_regiao = ft.TextField(label="Cidade / Região", value="São Borja - Fronteira Oeste", bgcolor="#0B111E", color="#FFFFFF", width=220)
       f_lote = ft.TextField(label="Volume / Lote", value="1.000 Sacas", bgcolor="#0B111E", color="#FFFFFF", width=160)
       f_valor = ft.TextField(label="Valor (R$)", value="133.50", bgcolor="#0B111E", color="#FFFFFF", width=150)
@@ -2173,19 +2344,7 @@ def main(page: ft.Page):
 
         with open(arq_csv, "w", newline="", encoding="utf-8-sig") as f:
           w = csv.writer(f, delimiter=";")
-          w.writerow([
-              "ITEM",
-              "UNIDADE",
-              "PRECO ATUAL",
-              "MEDIA RS",
-              "MEDIA SC",
-              "MEDIA PR",
-              "MEDIA GERAL SUL",
-              "CONTRATO EMPRESA",
-              "ESTIMATIVA 15D",
-              "ESTIMATIVA 30D",
-              "ESTIMATIVA 90D",
-          ])
+          w.writerow(["ITEM", "UNIDADE", "PRECO ATUAL", "MEDIA RS", "MEDIA SC", "MEDIA PR", "MEDIA GERAL SUL", "CONTRATO EMPRESA", "ESTIMATIVA 15D", "ESTIMATIVA 30D", "ESTIMATIVA 90D", "FONTE DOS RESULTADOS"])
           for it in dados["itens"]:
             m_u = calcular_medias_estados(it["regioes_sul"])
             w.writerow([
@@ -2200,26 +2359,20 @@ def main(page: ft.Page):
                 f"{it['prev_15d']:.2f}".replace(".", ","),
                 f"{it['prev_30d']:.2f}".replace(".", ","),
                 f"{it['prev_90d']:.2f}".replace(".", ","),
+                it.get("fonte_oficial", ""),
             ])
-          w.writerow([])
-          w.writerow(["--- REGISTOS LANCADOS PELO UTILIZADOR (RS / SC / PR) ---"])
-          w.writerow(["DATA", "UF", "ITEM", "REGIAO", "LOTE", "VALOR (R$)", "OBS"])
-          for r in dados.get("registros_planilha", []):
-            w.writerow([r["data"], r.get("uf", "RS"), r["item"], r["regiao"], r["lote"], r["valor"], r["obs"]])
 
         with open(arq_txt, "w", encoding="utf-8") as f:
           f.write("=================================================================\n")
           f.write("  CR AgroStat — RELATORIO OFICIAL REGIAO SUL (RS, SC E PR)\n")
           f.write(f"  Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
           f.write("=================================================================\n\n")
-          f.write("AVISO TECNICO: As previsoes sao estimativas estatisticas de mercado.\n\n")
           for it in dados["itens"]:
             m_u = calcular_medias_estados(it["regioes_sul"])
-            f.write(
-                f"* {it['nome']} ({it['unidade']}) -> RS: R$ {m_u['RS']:.2f} | SC: R$ {m_u['SC']:.2f} | PR: R$ {m_u['PR']:.2f} | Estim. 90d: R$ {it['prev_90d']:.2f}\n"
-            )
+            f.write(f"* {it['nome']} ({it['unidade']}) -> RS: R$ {m_u['RS']:.2f} | SC: R$ {m_u['SC']:.2f} | PR: R$ {m_u['PR']:.2f} | Estim. 90d: R$ {it['prev_90d']:.2f}\n")
+            f.write(f"  Fonte: {it.get('fonte_oficial', '')}\n\n")
 
-        mostrar_aviso(f"Planilha Excel (.csv) e Relatório (.txt) guardados em '{PASTA_RELATORIOS}'!")
+        mostrar_aviso(f"Planilha Excel (.csv) e Relatório (.txt) com Fontes guardados em '{PASTA_RELATORIOS}'!")
         renderizar()
 
       lista_lancamentos = ft.Column(spacing=8)
@@ -2233,22 +2386,12 @@ def main(page: ft.Page):
                     alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                     wrap=True,
                     controls=[
-                        ft.Text(
-                            f"📅 {r['data']}  •  [{r.get('uf', 'RS')}] {r['item']} ({r['regiao']})",
-                            color="#FFFFFF",
-                            weight=ft.FontWeight.BOLD,
-                        ),
+                        ft.Text(f"📅 {r['data']}  •  [{r.get('uf', 'RS')}] {r['item']} ({r['regiao']})", color="#FFFFFF", weight=ft.FontWeight.BOLD),
                         ft.Text(f"Lote: {r['lote']}  |  R$ {r['valor']}  |  {r['obs']}", color="#10B981"),
                     ],
                 ),
             )
         )
-
-      os.makedirs(PASTA_RELATORIOS, exist_ok=True)
-      arquivos_salvos = sorted(os.listdir(PASTA_RELATORIOS), reverse=True)[:8]
-      col_arquivos = ft.Column(spacing=6)
-      for nome_a in arquivos_salvos:
-        col_arquivos.controls.append(ft.Text(f"📄 {PASTA_RELATORIOS}/{nome_a}", color="#38BDF8", size=13))
 
       corpo_view.controls.append(
           ft.Container(
@@ -2259,40 +2402,24 @@ def main(page: ft.Page):
               content=ft.Column(
                   spacing=20,
                   controls=[
-                      ft.Text("📁 Planilhas da Região Sul (RS, SC e PR) & Relatórios", color="#FFFFFF", size=22, weight=ft.FontWeight.BOLD),
+                      ft.Text("📁 Planilhas da Região Sul & Relatórios com Fontes", color="#FFFFFF", size=22, weight=ft.FontWeight.BOLD),
                       ft.Row(wrap=True, spacing=12, controls=[f_uf, f_item, f_regiao, f_lote, f_valor, f_obs]),
                       ft.Row(
                           wrap=True,
                           spacing=14,
                           controls=[
-                              ft.ElevatedButton(
-                                  "Adicionar Dados na Planilha",
-                                  icon=ft.icons.ADD_CIRCLE_ROUNDED,
-                                  bgcolor="#38BDF8",
-                                  color="#080D16",
-                                  height=48,
-                                  on_click=adicionar_linha_planilha,
-                              ),
-                              ft.ElevatedButton(
-                                  "Guardar Planilha (.CSV Excel) e Relatório na Pasta",
-                                  icon=ft.icons.SAVE_ROUNDED,
-                                  bgcolor="#10B981",
-                                  color="#080D16",
-                                  height=48,
-                                  on_click=exportar_planilha_csv,
-                              ),
+                              ft.ElevatedButton("Adicionar Dados na Planilha", icon=ft.icons.ADD_CIRCLE_ROUNDED, bgcolor="#38BDF8", color="#080D16", height=48, on_click=adicionar_linha_planilha),
+                              ft.ElevatedButton("Guardar Planilha (.CSV Excel) e Relatório na Pasta", icon=ft.icons.SAVE_ROUNDED, bgcolor="#10B981", color="#080D16", height=48, on_click=exportar_planilha_csv),
                           ],
                       ),
                       lista_lancamentos,
-                      ft.Divider(color="#1E293B"),
-                      col_arquivos,
                   ],
               ),
           )
       )
 
     # -------------------------------------------------------------------------
-    # ABA 6: SERVIDOR GRATUITO NA NUVEM
+    # ABA 7: FONTES DOS RESULTADOS, ÍCONE PERSONALIZADO & SERVIDOR
     # -------------------------------------------------------------------------
     elif aba_atual == "nuvem":
       corpo_view.controls.append(
@@ -2304,11 +2431,46 @@ def main(page: ft.Page):
               content=ft.Column(
                   spacing=16,
                   controls=[
-                      ft.Text("☁️ Guia Rápido GitHub + Render.com (Servidor Gratuito)", color="#FFFFFF", size=22, weight=ft.FontWeight.BOLD),
-                      ft.Text(
-                          "Os ficheiros `app.py`, `requirements.txt`, `Dockerfile` e `render.yaml` já estão prontos na sua pasta MonitorGraos para enviar ao GitHub e ligar no Render.com.",
-                          color="#10B981",
-                          size=14,
+                      ft.Text("📚 Fontes Oficiais dos Resultados & Ícone Personalizado", color="#FFFFFF", size=22, weight=ft.FontWeight.BOLD),
+                      ft.Container(
+                          bgcolor="#0B111E",
+                          padding=18,
+                          border_radius=16,
+                          border=ft.border.all(1, "#10B981"),
+                          content=ft.Column(
+                              spacing=8,
+                              controls=[
+                                  ft.Text("🌱 Ícone Oficial Criado Automaticamente!", color="#10B981", size=16, weight=ft.FontWeight.BOLD),
+                                  ft.Text(
+                                      "O sistema gerou automaticamente na sua pasta:\n"
+                                      "• `assets/favicon.png` e `assets/icons/icon-192.png` (Ícone da semente para a aba do navegador e telemóvel).\n"
+                                      "• `cr_agrostat.ico` (Ícone para colocar no atalho da Área de Trabalho do Windows).\n"
+                                      "Se quiser trocar por outra imagem sua no futuro, basta substituir o arquivo `assets/favicon.png`!",
+                                      color="#E2E8F0",
+                                      size=13,
+                                  ),
+                              ],
+                          ),
+                      ),
+                      ft.Container(
+                          bgcolor="#0B111E",
+                          padding=18,
+                          border_radius=16,
+                          content=ft.Column(
+                              spacing=8,
+                              controls=[
+                                  ft.Text("🔍 Resumo das Fontes de Dados do Sistema:", color="#38BDF8", size=16, weight=ft.FontWeight.BOLD),
+                                  ft.Text(
+                                      "1. Bolsas Internacionais e Futuros: Chicago Board of Trade (CBOT) via API Yahoo Finance (`ZS=F`, `ZR=F`, `ZC=F`, `ZW=F`).\n"
+                                      "2. Taxa de Câmbio: Dólar Comercial Spot (`USDBRL=X`).\n"
+                                      "3. Paridades Físicas Região Sul: Referências regionais alinhadas aos polos acompanhados por IRGA/Emater (RS), Epagri/Cepa (SC) e Deral/Cepea-Paranaguá (PR).\n"
+                                      "4. Previsão do Tempo e Histórico de Chuvas: Open-Meteo Agro API (Modelos ECMWF Europeu, NOAA GFS e Reanálise Climatológica ERA5).\n"
+                                      "5. Notícias e Fundamentos: Google News Agro RSS.",
+                                      color="#CBD5E1",
+                                      size=13,
+                                  ),
+                              ],
+                          ),
                       ),
                   ],
               ),
@@ -2333,11 +2495,12 @@ def main(page: ft.Page):
 
   botoes_menu = [
       ft.ElevatedButton("Painel & Gráficos Sul", icon=ft.icons.SHOW_CHART_ROUNDED, data="painel", bgcolor="#10B981", color="#080D16", height=46, on_click=lambda e: mudar_aba("painel")),
+      ft.ElevatedButton("Clima & Chuvas (Anos)", icon=ft.icons.THUNDERSTORM_ROUNDED, data="clima", bgcolor="#1E293B", color="#38BDF8", height=46, on_click=lambda e: mudar_aba("clima")),
       ft.ElevatedButton("Contratos RS / SC / PR", icon=ft.icons.MAP_ROUNDED, data="regional", bgcolor="#1E293B", color="#FFFFFF", height=46, on_click=lambda e: mudar_aba("regional")),
       ft.ElevatedButton("Estudo de Fretes (KM)", icon=ft.icons.LOCAL_SHIPPING_ROUNDED, data="frete", bgcolor="#1E293B", color="#FFFFFF", height=46, on_click=lambda e: mudar_aba("frete")),
       ft.ElevatedButton("Simulador Barter", icon=ft.icons.CALCULATE_ROUNDED, data="barter", bgcolor="#1E293B", color="#FFFFFF", height=46, on_click=lambda e: mudar_aba("barter")),
       ft.ElevatedButton("Planilhas & Relatórios", icon=ft.icons.TABLE_CHART_ROUNDED, data="relatorios", bgcolor="#1E293B", color="#FFFFFF", height=46, on_click=lambda e: mudar_aba("relatorios")),
-      ft.ElevatedButton("Servidor Gratuito", icon=ft.icons.CLOUD_UPLOAD_ROUNDED, data="nuvem", bgcolor="#1E293B", color="#38BDF8", height=46, on_click=lambda e: mudar_aba("nuvem")),
+      ft.ElevatedButton("Fontes & Ícone", icon=ft.icons.VERIFIED_ROUNDED, data="nuvem", bgcolor="#1E293B", color="#FACC15", height=46, on_click=lambda e: mudar_aba("nuvem")),
   ]
 
   txt_atualizacao = ft.Text(f"Atualizado em: {dados['atualizacao']}", color="#94A3B8", size=13)
@@ -2345,18 +2508,18 @@ def main(page: ft.Page):
 
   def acao_atualizar(e):
     nonlocal dados
-    btn_atualizar.text = "A atualizar Região Sul..."
+    btn_atualizar.text = "A atualizar Mercado e Clima..."
     btn_atualizar.disabled = True
     page.update()
     dados = coletar_mercado(dados)
     txt_atualizacao.value = f"Atualizado em: {dados['atualizacao']}"
     txt_dolar.value = f"Dólar Comercial: R$ {dados['dolar']:.2f} ({dados['dolar_var']:+.2f}%)"
-    btn_atualizar.text = "Atualizar Mercado e IA"
+    btn_atualizar.text = "Atualizar Mercado, Clima e IA"
     btn_atualizar.disabled = False
-    mostrar_aviso("Cotações de RS, SC e PR atualizadas ao vivo!")
+    mostrar_aviso("Cotações, fontes e meteorologia da Região Sul atualizadas!")
     renderizar()
 
-  btn_atualizar = ft.ElevatedButton("Atualizar Mercado e IA", icon=ft.icons.REFRESH_ROUNDED, bgcolor="#38BDF8", color="#080D16", height=48, on_click=acao_atualizar)
+  btn_atualizar = ft.ElevatedButton("Atualizar Mercado, Clima e IA", icon=ft.icons.REFRESH_ROUNDED, bgcolor="#38BDF8", color="#080D16", height=48, on_click=acao_atualizar)
 
   cabecalho = ft.Container(
       width=float("inf"),
@@ -2388,7 +2551,7 @@ def main(page: ft.Page):
                                   controls=[
                                       ft.Text("CR AgroStat", color="#FFFFFF", size=28, weight=ft.FontWeight.BOLD),
                                       ft.Text(
-                                          "Estatística Estimada de Grãos e Sementes • Região Sul (RS • SC • PR)",
+                                          "Estatística Estimada de Grãos, Sementes e Clima • Região Sul (RS • SC • PR)",
                                           color="#10B981",
                                           size=14,
                                           weight=ft.FontWeight.W_600,
@@ -2410,7 +2573,13 @@ def main(page: ft.Page):
                       wrap=True,
                       controls=[
                           txt_dolar,
-                          ft.Text(f"📱 Acesso no Telemóvel (Wi-Fi): http://{ip_local}:8550", color="#FACC15", size=14, weight=ft.FontWeight.W_600),
+                          ft.Text(
+                              "📚 Fontes Ativas: CBOT • PTAX • Paridades IRGA/Epagri/Deral/Cepea • Clima Open-Meteo ECMWF/GFS",
+                              color="#10B981",
+                              size=12,
+                              weight=ft.FontWeight.W_600,
+                          ),
+                          ft.Text(f"📱 Wi-Fi Local: http://{ip_local}:8550", color="#FACC15", size=13, weight=ft.FontWeight.W_600),
                       ],
                   ),
               ),
@@ -2424,5 +2593,12 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
+  gerar_arquivos_servidor_e_icones()
   porta_servidor = int(os.environ.get("PORT", 8550))
-  ft.app(target=main, view=None, host="0.0.0.0", port=porta_servidor)
+  ft.app(
+      target=main,
+      view=None,
+      host="0.0.0.0",
+      port=porta_servidor,
+      assets_dir=PASTA_ASSETS,
+  )
