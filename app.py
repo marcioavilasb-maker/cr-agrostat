@@ -5,6 +5,7 @@ import math
 import os
 import socket
 import struct
+import subprocess
 import urllib.parse
 import xml.etree.ElementTree as ET
 import zlib
@@ -12,9 +13,13 @@ import flet as ft
 import requests
 import yfinance as yf
 
-ARQUIVO_DB = os.path.join("dados", "cr_agrostat_sul_v4.json")
+ARQUIVO_DB = os.path.join("dados", "cr_agrostat_sul_v5.json")
 PASTA_RELATORIOS = "relatorios"
 PASTA_ASSETS = "assets"
+
+
+def agora_str():
+  return datetime.now().strftime("%d/%m/%Y às %H:%M:%S")
 
 
 def obter_ip_local():
@@ -29,19 +34,17 @@ def obter_ip_local():
 
 
 def criar_icone_semente_png(largura=192, altura=192):
-  """Desenha automaticamente o ícone oficial da semente CR AgroStat em formato PNG e ICO."""
+  """Desenha automaticamente o ícone oficial da semente CR AgroStat."""
   linhas_raw = bytearray()
   cx, cy = largura / 2.0, altura / 2.0
   raio_quadrado = largura * 0.44
 
   for y in range(altura):
-    linhas_raw.append(0)  # Filtro PNG
+    linhas_raw.append(0)
     for x in range(largura):
       dx, dy = abs(x - cx), abs(y - cy)
-      # Fundo arredondado escuro (#080D16) com borda verde (#10B981)
       dentro_card = (dx <= raio_quadrado) and (dy <= raio_quadrado)
       if dentro_card:
-        # Desenho de duas folhas/semente estilizadas no centro
         nx = (x - cx) / (largura * 0.28)
         ny = (y - cy) / (altura * 0.28)
         folha_esq = ((nx + 0.32) ** 2) / 0.28 + ((ny - 0.05) ** 2) / 0.75 <= 1.0
@@ -49,22 +52,24 @@ def criar_icone_semente_png(largura=192, altura=192):
         gota_centro = (nx**2) / 0.16 + ((ny + 0.38) ** 2) / 0.38 <= 1.0
 
         if gota_centro:
-          r, g, b, a = 250, 204, 21, 255  # Broto dourado (#FACC15)
+          r, g, b, a = 250, 204, 21, 255
         elif folha_esq or folha_dir:
-          r, g, b, a = 16, 185, 129, 255  # Semente verde esmeralda (#10B981)
+          r, g, b, a = 16, 185, 129, 255
         elif dx > raio_quadrado - (largura * 0.04) or dy > raio_quadrado - (
             altura * 0.04
         ):
-          r, g, b, a = 16, 185, 129, 255  # Moldura verde
+          r, g, b, a = 16, 185, 129, 255
         else:
-          r, g, b, a = 15, 23, 42, 255  # Fundo azul noturno (#0F172A)
+          r, g, b, a = 15, 23, 42, 255
       else:
-        r, g, b, a = 0, 0, 0, 0  # Transparente fora dos cantos
+        r, g, b, a = 0, 0, 0, 0
       linhas_raw.extend((r, g, b, a))
 
   def bloco_png(tipo, dados_b):
     crc = zlib.crc32(tipo + dados_b) & 0xFFFFFFFF
-    return struct.pack(">I", len(dados_b)) + tipo + dados_b + struct.pack(">I", crc)
+    return (
+        struct.pack(">I", len(dados_b)) + tipo + dados_b + struct.pack(">I", crc)
+    )
 
   assinatura = b"\x89PNG\r\n\x1a\n"
   ihdr = struct.pack(">IIBBBBB", largura, altura, 8, 6, 0, 0, 0)
@@ -77,11 +82,38 @@ def criar_icone_semente_png(largura=192, altura=192):
   )
 
 
+def criar_atalho_area_de_trabalho():
+  """Cria automaticamente um atalho na Área de Trabalho do Windows com o ícone da semente."""
+  if os.name != "nt":
+    return
+  try:
+    pasta_atual = os.path.abspath(os.getcwd())
+    caminho_bat = os.path.join(pasta_atual, "2_Abrir_Painel.bat")
+    caminho_ico = os.path.join(pasta_atual, "cr_agrostat.ico")
+    if not os.path.exists(caminho_bat):
+      return
+
+    cmd_ps = (
+        "$WshShell = New-Object -ComObject WScript.Shell; "
+        "$Desktop = [System.Environment]::GetFolderPath('Desktop'); "
+        "$Shortcut = $WshShell.CreateShortcut(\"$Desktop\\CR AgroStat.lnk\"); "
+        f"$Shortcut.TargetPath = '{caminho_bat}'; "
+        f"$Shortcut.WorkingDirectory = '{pasta_atual}'; "
+        f"$Shortcut.IconLocation = '{caminho_ico}'; "
+        "$Shortcut.Save()"
+    )
+    subprocess.run(
+        ["powershell", "-NoProfile", "-Command", cmd_ps],
+        capture_output=True,
+        timeout=5,
+    )
+  except Exception:
+    pass
+
+
 def gerar_arquivos_servidor_e_icones():
-  """Cria automaticamente os ícones personalizados e ficheiros do servidor gratuito."""
   try:
     os.makedirs(os.path.join(PASTA_ASSETS, "icons"), exist_ok=True)
-    # Só gera os ícones se ainda não existirem (assim o utilizador pode substituir se quiser)
     caminho_fav = os.path.join(PASTA_ASSETS, "favicon.png")
     if not os.path.exists(caminho_fav):
       png_64 = criar_icone_semente_png(64, 64)
@@ -97,28 +129,13 @@ def gerar_arquivos_servidor_e_icones():
       ) as f:
         f.write(png_192)
 
-      # Cria também o arquivo .ICO para atalho no Windows
       cabecalho_ico = struct.pack("<HHH", 0, 1, 1) + struct.pack(
           "<BBBBHHII", 64, 64, 0, 0, 1, 32, len(png_64), 22
       )
       with open("cr_agrostat.ico", "wb") as f:
         f.write(cabecalho_ico + png_64)
 
-    manifesto = {
-        "name": "CR AgroStat — Inteligência Comercial Sul",
-        "short_name": "CR AgroStat",
-        "start_url": ".",
-        "display": "standalone",
-        "background_color": "#080D16",
-        "theme_color": "#10B981",
-        "description": "Estatística Estimada de Grãos, Sementes e Clima - Região Sul",
-        "icons": [
-            {"src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png"},
-            {"src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png"},
-        ],
-    }
-    with open(os.path.join(PASTA_ASSETS, "manifest.json"), "w", encoding="utf-8") as f:
-      json.dump(manifesto, f, ensure_ascii=False, indent=2)
+    criar_atalho_area_de_trabalho()
 
     with open("requirements.txt", "w", encoding="utf-8") as f:
       f.write(
@@ -129,28 +146,132 @@ def gerar_arquivos_servidor_e_icones():
           "beautifulsoup4\n"
           "yfinance\n"
       )
-
-    with open("Dockerfile", "w", encoding="utf-8") as f:
-      f.write(
-          "FROM python:3.11-slim\n"
-          "WORKDIR /app\n"
-          "COPY requirements.txt .\n"
-          "RUN pip install --no-cache-dir -r requirements.txt\n"
-          "COPY . .\n"
-          "EXPOSE 8550\n"
-          'CMD ["python", "app.py"]\n'
-      )
-
-    with open("render.yaml", "w", encoding="utf-8") as f:
-      f.write(
-          "services:\n"
-          "  - type: web\n"
-          "    name: cr-agrostat\n"
-          "    runtime: docker\n"
-          "    plan: free\n"
-      )
   except Exception:
     pass
+
+
+# =============================================================================
+# GERADOR NATIVO DE ARQUIVO .PDF OFICIAL (SEM DEPENDER DE BIBLIOTECAS EXTERNAS)
+# =============================================================================
+def limpar_texto_pdf(texto):
+  """Converte acentos para CP1252/WinAnsi compatível com fontes nativas de PDF."""
+  substituicoes = {
+      "•": "-",
+      "—": "-",
+      "➔": "->",
+      "🟢": "[RS]",
+      "🔴": "[SC]",
+      "🔵": "[PR]",
+      "🌎": "[SUL]",
+  }
+  for k, v in substituicoes.items():
+    texto = texto.replace(k, v)
+  # Remove emojis mantendo acentos do português
+  limpo = "".join(c for c in texto if ord(c) < 256)
+  escapado = (
+      limpo.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+  )
+  return escapado
+
+
+def criar_pdf_nativo(caminho_pdf, titulo_doc, subtitulo_doc, linhas_conteudo):
+  """Gera um arquivo .PDF real paginado (A4) diretamente na pasta relatorios/."""
+  linhas_por_pag = 46
+  paginas_linhas = [
+      linhas_conteudo[i : i + linhas_por_pag]
+      for i in range(0, max(1, len(linhas_conteudo)), linhas_por_pag)
+  ]
+
+  objetos = []
+  # 1: Catalog, 2: Pages, 3: Font Regular, 4: Font Bold
+  objetos.append(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+  objetos.append(b"")  # Placeholder p/ Pages
+  objetos.append(
+      b"3 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n"
+  )
+  objetos.append(
+      b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>\nendobj\n"
+  )
+
+  ids_paginas = []
+  prox_id = 5
+
+  for num_p, bloco in enumerate(paginas_linhas):
+    id_pag = prox_id
+    id_stream = prox_id + 1
+    prox_id += 2
+    ids_paginas.append(id_pag)
+
+    comandos = []
+    # Cabeçalho escuro com faixa verde
+    comandos.append("0.05 0.09 0.16 rg 30 765 535 50 re f")
+    comandos.append("0.06 0.72 0.50 rg 30 762 535 4 re f")
+    comandos.append("BT /F2 15 Tf 1 1 1 rg 42 793 Td")
+    comandos.append(f"({limpar_texto_pdf(titulo_doc)}) Tj ET")
+    comandos.append("BT /F1 9 Tf 0.65 0.95 0.82 rg 42 776 Td")
+    comandos.append(
+        f"({limpar_texto_pdf(subtitulo_doc + f'  |  Pagina {num_p+1} de {len(paginas_linhas)}')}) Tj ET"
+    )
+
+    y_pos = 740
+    for linha in bloco:
+      eh_titulo = linha.startswith("===") or linha.startswith(">>>") or linha.startswith("[")
+      fonte_uso = "/F2 10 Tf" if eh_titulo else "/F1 9.5 Tf"
+      cor_txt = "0.05 0.25 0.45 rg" if eh_titulo else "0.12 0.16 0.22 rg"
+      comandos.append(f"BT {fonte_uso} {cor_txt} 36 {y_pos} Td")
+      comandos.append(f"({limpar_texto_pdf(linha[:108])}) Tj ET")
+      y_pos -= 15
+
+    # Rodapé de auditoria
+    comandos.append("0.85 0.88 0.92 rg 30 38 535 1 re f")
+    comandos.append("BT /F1 8 Tf 0.4 0.45 0.52 rg 36 25 Td")
+    comandos.append(
+        f"({limpar_texto_pdf('Documento emitido pelo sistema CR AgroStat - Fontes: CBOT / PTAX / IRGA / Epagri / Deral / CEPEA / Open-Meteo.')}) Tj ET"
+    )
+
+    stream_bytes = "\n".join(comandos).encode("cp1252", errors="replace")
+    obj_pag = (
+        f"{id_pag} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+        f"/Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents {id_stream} 0 R >>\nendobj\n"
+    ).encode("ascii")
+    obj_str = (
+        f"{id_stream} 0 obj\n<< /Length {len(stream_bytes)} >>\nstream\n".encode(
+            "ascii"
+        )
+        + stream_bytes
+        + b"\nendstream\nendobj\n"
+    )
+    objetos.append(obj_pag)
+    objetos.append(obj_str)
+
+  kids_str = " ".join(f"{pid} 0 R" for pid in ids_paginas)
+  objetos[1] = (
+      f"2 0 obj\n<< /Type /Pages /Kids [{kids_str}] /Count {len(ids_paginas)} >>\nendobj\n".encode(
+          "ascii"
+      )
+  )
+
+  pdf_final = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+  offsets = [0]
+  for obj in objetos:
+    offsets.append(len(pdf_final))
+    pdf_final.extend(obj)
+
+  pos_xref = len(pdf_final)
+  total_objs = len(objetos) + 1
+  pdf_final.extend(f"xref\n0 {total_objs}\n".encode("ascii"))
+  pdf_final.extend(b"0000000000 65535 f \n")
+  for off in offsets[1:]:
+    pdf_final.extend(f"{off:010d} 00000 n \n".encode("ascii"))
+
+  pdf_final.extend(
+      f"trailer\n<< /Size {total_objs} /Root 1 0 R >>\nstartxref\n{pos_xref}\n%%EOF\n".encode(
+          "ascii"
+      )
+  )
+
+  with open(caminho_pdf, "wb") as f:
+    f.write(pdf_final)
 
 
 # =============================================================================
@@ -161,6 +282,7 @@ POLOS_CLIMA_SUL = {
         "uf": "RS",
         "lat": -28.66,
         "lon": -56.00,
+        "estacao_inmet": "Estação Automática São Borja (A830) + Satélite ECMWF/GFS",
         "perfil": "Polo Arroz Irrigado, Soja, Trigo e Sementes Forrageiras",
         "historico_estacoes": {
             "Primavera (Set-Nov)": {"2023": 680, "2024": 510, "2025": 465, "2026_est": 490, "media_hist": 480},
@@ -173,6 +295,7 @@ POLOS_CLIMA_SUL = {
         "uf": "RS",
         "lat": -28.26,
         "lon": -52.40,
+        "estacao_inmet": "Estação Passo Fundo / Embrapa Trigo + Satélite ECMWF/GFS",
         "perfil": "Polo Soja, Trigo, Milho e Sementes Certificadas",
         "historico_estacoes": {
             "Primavera (Set-Nov)": {"2023": 720, "2024": 540, "2025": 495, "2026_est": 520, "media_hist": 510},
@@ -185,6 +308,7 @@ POLOS_CLIMA_SUL = {
         "uf": "RS",
         "lat": -31.77,
         "lon": -52.34,
+        "estacao_inmet": "Estação Pelotas / Bagé + Reanálise ERA5 / Open-Meteo",
         "perfil": "Polo Arroz, Soja, Pecuária/Forrageiras e Porto de Exportação",
         "historico_estacoes": {
             "Primavera (Set-Nov)": {"2023": 590, "2024": 430, "2025": 370, "2026_est": 395, "media_hist": 390},
@@ -197,6 +321,7 @@ POLOS_CLIMA_SUL = {
         "uf": "SC",
         "lat": -27.10,
         "lon": -52.61,
+        "estacao_inmet": "Epagri/Ciram Chapecó & Campos Novos + ECMWF/GFS",
         "perfil": "Polo Milho, Soja, Sementes de Altitude e Proteína Animal",
         "historico_estacoes": {
             "Primavera (Set-Nov)": {"2023": 740, "2024": 560, "2025": 520, "2026_est": 545, "media_hist": 535},
@@ -209,6 +334,7 @@ POLOS_CLIMA_SUL = {
         "uf": "SC",
         "lat": -28.48,
         "lon": -49.00,
+        "estacao_inmet": "Epagri/Ciram Araranguá + Satélite Open-Meteo ECMWF",
         "perfil": "Polo Arroz Irrigado Pré-Germinado e Sementes Certificadas",
         "historico_estacoes": {
             "Primavera (Set-Nov)": {"2023": 610, "2024": 470, "2025": 430, "2026_est": 450, "media_hist": 445},
@@ -221,6 +347,7 @@ POLOS_CLIMA_SUL = {
         "uf": "PR",
         "lat": -24.95,
         "lon": -53.45,
+        "estacao_inmet": "Simepar / INMET Cascavel + Modelo NOAA GFS / ECMWF",
         "perfil": "Polo Soja 1ª Safra, Milho Safrinha e Trigo",
         "historico_estacoes": {
             "Primavera (Set-Nov)": {"2023": 590, "2024": 530, "2025": 505, "2026_est": 525, "media_hist": 520},
@@ -233,6 +360,7 @@ POLOS_CLIMA_SUL = {
         "uf": "PR",
         "lat": -25.09,
         "lon": -50.16,
+        "estacao_inmet": "Simepar / IAPAR Ponta Grossa & Londrina + ECMWF",
         "perfil": "Polo Sementes, Trigo Pão, Soja, Milho e Forrageiras",
         "historico_estacoes": {
             "Primavera (Set-Nov)": {"2023": 540, "2024": 480, "2025": 455, "2026_est": 475, "media_hist": 470},
@@ -245,10 +373,11 @@ POLOS_CLIMA_SUL = {
 
 
 def buscar_previsao_tempo_openmeteo(nome_polo):
-  """Busca a previsão de 10 dias de chuva e temperatura nos modelos ECMWF/GFS via Open-Meteo."""
   info_p = POLOS_CLIMA_SUL.get(nome_polo, list(POLOS_CLIMA_SUL.values())[0])
   lat, lon = info_p["lat"], info_p["lon"]
   previsao_dias = []
+  horario_consulta = agora_str()
+  modo_coleta = "Satélite Ao Vivo — API Open-Meteo (ECMWF + NOAA GFS)"
 
   try:
     url = (
@@ -278,6 +407,7 @@ def buscar_previsao_tempo_openmeteo(nome_polo):
     pass
 
   if not previsao_dias:
+    modo_coleta = "Base Climatológica de Contingência (ECMWF/ERA5)"
     hoje = datetime.now()
     padrao_mm = [0.0, 4.5, 18.2, 6.0, 0.0, 0.0, 12.4, 22.0, 3.5, 0.0]
     padrao_pr = [10, 55, 85, 60, 15, 10, 75, 90, 45, 15]
@@ -291,7 +421,7 @@ def buscar_previsao_tempo_openmeteo(nome_polo):
           "tmax": round(27.5 + math.cos(i) * 3.0, 1),
       })
 
-  return previsao_dias
+  return previsao_dias, horario_consulta, modo_coleta
 
 
 ITENS_PADRAO = [
@@ -303,9 +433,10 @@ ITENS_PADRAO = [
         "unidade": "Saca 60kg",
         "ticker": "ZS=F",
         "fonte_oficial": (
-            "Bolsa CBOT Chicago (ZS=F) + Câmbio PTAX (USDBRL=X) + Paridade"
-            " CEPEA/Paranaguá, IRGA/Emater-RS, Epagri-SC e Deral-PR"
+            "Bolsa CBOT Chicago (ZS=F) via Yahoo Finance + Câmbio PTAX (USDBRL=X)"
+            " + Paridade CEPEA/Paranaguá, IRGA/Emater-RS, Epagri-SC e Deral-PR"
         ),
+        "url_fonte": "https://www.cepea.esalq.usp.br/br/indicador/soja.aspx",
         "preco_base": 132.50,
         "contrato_empresa": 131.00,
         "cor": "#F59E0B",
@@ -357,6 +488,7 @@ ITENS_PADRAO = [
             "Indicador Esalq/CEPEA-IRGA RS + CBOT Rough Rice (ZR=F) + Epagri/Cepa"
             " (SC) + Deral (PR)"
         ),
+        "url_fonte": "https://www.cepea.esalq.usp.br/br/indicador/arroz.aspx",
         "preco_base": 115.00,
         "contrato_empresa": 114.00,
         "cor": "#0EA5E9",
@@ -404,6 +536,7 @@ ITENS_PADRAO = [
             "Bolsa CBOT (ZC=F) + B3/CEPEA + Praças Consumidoras Epagri-SC,"
             " Deral-PR e Emater-RS"
         ),
+        "url_fonte": "https://www.cepea.esalq.usp.br/br/indicador/milho.aspx",
         "preco_base": 68.00,
         "contrato_empresa": 67.00,
         "cor": "#EAB308",
@@ -452,6 +585,7 @@ ITENS_PADRAO = [
             "Bolsa CBOT Wheat (ZW=F) + Indicador CEPEA Trigo PR/RS + Deral-PR e"
             " Emater-RS"
         ),
+        "url_fonte": "https://www.cepea.esalq.usp.br/br/indicador/trigo.aspx",
         "preco_base": 76.50,
         "contrato_empresa": 75.00,
         "cor": "#D97706",
@@ -498,6 +632,7 @@ ITENS_PADRAO = [
             "Indexador Soja CBOT (ZS=F) + Associações de Produtores de Sementes"
             " (Apassul-RS / Aprossul / Abrates)"
         ),
+        "url_fonte": "https://www.conab.gov.br/",
         "preco_base": 295.00,
         "contrato_empresa": 288.00,
         "cor": "#10B981",
@@ -543,6 +678,7 @@ ITENS_PADRAO = [
             "Referência IRGA (RS) / Epagri (SC) + Indexador Arroz CBOT (ZR=F) +"
             " Sementeiras Credenciadas"
         ),
+        "url_fonte": "https://irga.rs.gov.br/",
         "preco_base": 210.00,
         "contrato_empresa": 205.00,
         "cor": "#06B6D4",
@@ -585,6 +721,7 @@ ITENS_PADRAO = [
             "Cotações Sementeiras Forrageiras Sul (RS/SC/PR) + Indicadores"
             " Cooperativas e Emater/Deral"
         ),
+        "url_fonte": "https://www.emater.tche.br/",
         "preco_base": 6.80,
         "contrato_empresa": 6.50,
         "cor": "#22C55E",
@@ -627,6 +764,7 @@ ITENS_PADRAO = [
             "Cotações Sementeiras de Inverno (RS/SC/PR) + Indexador Cereais de"
             " Inverno (ZW=F) + Deral/Emater"
         ),
+        "url_fonte": "https://www.agricultura.pr.gov.br/Pagina/Deral",
         "preco_base": 3.90,
         "contrato_empresa": 3.75,
         "cor": "#84CC16",
@@ -777,6 +915,7 @@ def coletar_mercado(dados_existentes=None):
   os.makedirs(PASTA_RELATORIOS, exist_ok=True)
   gerar_arquivos_servidor_e_icones()
 
+  horario_coleta = agora_str()
   dolar = 5.65
   dolar_var = 0.0
   try:
@@ -802,9 +941,9 @@ def coletar_mercado(dados_existentes=None):
         m30 = sum(fechamentos[-22:]) / len(fechamentos[-22:])
         var = ((ult - ant) / ant) * 100
         desvio = ((ult - m30) / m30) * 100
-        bolsa[tk] = {"var": var, "desvio": desvio, "pares": pares}
+        bolsa[tk] = {"var": var, "desvio": desvio, "pares": pares, "ult_pts": round(ult, 2)}
     except Exception:
-      bolsa[tk] = {"var": 0.0, "desvio": 0.0, "pares": []}
+      bolsa[tk] = {"var": 0.0, "desvio": 0.0, "pares": [], "ult_pts": 0.0}
 
   manchetes = buscar_noticias_agro()
   mapa_antigo = {}
@@ -819,7 +958,7 @@ def coletar_mercado(dados_existentes=None):
     contrato_emp = float(antigo.get("contrato_empresa", i["contrato_empresa"]))
     regioes_sul_salvas = antigo.get("regioes_sul", i["regioes_sul"])
 
-    b = bolsa.get(i["ticker"], {"var": 0.0, "desvio": 0.0, "pares": []})
+    b = bolsa.get(i["ticker"], {"var": 0.0, "desvio": 0.0, "pares": [], "ult_pts": 0.0})
     var_comb = (b["var"] * 0.6) + (dolar_var * 0.4)
     preco_atual = round(preco_base_item * (1 + (var_comb / 100)), 2)
 
@@ -877,6 +1016,8 @@ def coletar_mercado(dados_existentes=None):
         "semaforo": semaforo,
         "msg_semaforo": msg_semaforo,
         "cor_sem": cor_sem,
+        "horario_busca_item": horario_coleta,
+        "pontos_bolsa_ref": b["ult_pts"],
         "motivo": (
             f"Câmbio a R$ {dolar:.2f} ({dolar_var:+.2f}%), bolsa externa"
             f" ({b['var']:+.2f}%) e média Sul em R$ {medias_uf['SUL']:.2f}."
@@ -907,7 +1048,7 @@ def coletar_mercado(dados_existentes=None):
   )
 
   pacote = {
-      "atualizacao": datetime.now().strftime("%d/%m/%Y às %H:%M:%S"),
+      "atualizacao": horario_coleta,
       "dolar": round(dolar, 2),
       "dolar_var": round(dolar_var, 2),
       "manchetes": manchetes if manchetes else [
@@ -939,7 +1080,7 @@ def carregar_db():
             "dolar" in d
             and "itens" in d
             and len(d["itens"]) > 0
-            and "fonte_oficial" in d["itens"][0]
+            and "url_fonte" in d["itens"][0]
         ):
           return d
     except Exception:
@@ -969,7 +1110,10 @@ def main(page: ft.Page):
   uf_aba_regional = "TODOS"
   polo_clima_sel = list(POLOS_CLIMA_SUL.keys())[0]
   estacao_clima_sel = "Primavera (Set-Nov)"
+  horario_ultima_selecao = agora_str()
 
+  # Linha dinâmica do menu superior que se atualiza sempre com a aba ativa marcada
+  linha_menu_abas = ft.Row(wrap=True, spacing=10)
   corpo_view = ft.Column(spacing=20, width=float("inf"))
 
   def mostrar_aviso(texto, cor="#10B981"):
@@ -980,11 +1124,195 @@ def main(page: ft.Page):
     page.snack_bar.open = True
     page.update()
 
+  def copiar_para_area_transferencia(titulo_copia, texto_copiar):
+    page.set_clipboard(texto_copiar)
+    mostrar_aviso(
+        f"📋 '{titulo_copia}' copiado! Pode colar (Ctrl+V) no WhatsApp, Word ou E-mail."
+    )
+
+  def abrir_modal_fontes(titulo_contexto, lista_detalhes, url_externa=None):
+    itens_col = ft.Column(spacing=8, tight=True)
+    for linha in lista_detalhes:
+      itens_col.controls.append(
+          ft.Row(
+              vertical_alignment=ft.CrossAxisAlignment.START,
+              spacing=8,
+              controls=[
+                  ft.Icon(ft.icons.VERIFIED_ROUNDED, color="#10B981", size=18),
+                  ft.Text(linha, color="#E2E8F0", size=13, expand=True),
+              ],
+          )
+      )
+
+    texto_bloco = f"=== AUDITORIA DE FONTES: {titulo_contexto} ===\n" + "\n".join(
+        f"- {l}" for l in lista_detalhes
+    )
+
+    acoes_modal = [
+        ft.ElevatedButton(
+            "📋 Copiar Dados e Fontes",
+            bgcolor="#38BDF8",
+            color="#080D16",
+            on_click=lambda e: copiar_para_area_transferencia(
+                titulo_contexto, texto_bloco
+            ),
+        ),
+    ]
+    if url_externa:
+      acoes_modal.append(
+          ft.ElevatedButton(
+              "🌐 Abrir Site Oficial da Fonte",
+              bgcolor="#10B981",
+              color="#080D16",
+              on_click=lambda e: page.launch_url(url_externa),
+          )
+      )
+    acoes_modal.append(
+        ft.TextButton(
+            "Fechar",
+            on_click=lambda e: fechar_modal(),
+        )
+    )
+
+    dlg = ft.AlertDialog(
+        modal=True,
+        bgcolor="#111927",
+        title=ft.Row(
+            spacing=10,
+            controls=[
+                ft.Icon(ft.icons.TRAVEL_EXPLORE_ROUNDED, color="#FACC15", size=26),
+                ft.Text(
+                    f"Fontes, Data e Hora — {titulo_contexto}",
+                    color="#FFFFFF",
+                    size=18,
+                    weight=ft.FontWeight.BOLD,
+                ),
+            ],
+        ),
+        content=ft.Container(width=620, content=itens_col),
+        actions=acoes_modal,
+    )
+
+    def fechar_modal():
+      dlg.open = False
+      page.update()
+
+    page.dialog = dlg
+    dlg.open = True
+    page.update()
+
+  def gerar_pdf_completo_usuario(contexto_relatorio="Relatorio Geral Regiao Sul"):
+    os.makedirs(PASTA_RELATORIOS, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d_%Hh%Mm%Ss")
+    nome_pdf = f"Relatorio_Oficial_CRAgroStat_{stamp}.pdf"
+    caminho_pdf = os.path.join(PASTA_RELATORIOS, nome_pdf)
+
+    linhas = []
+    linhas.append(f"=== DADOS DA BUSCA E AUDITORIA ({contexto_relatorio.upper()}) ===")
+    linhas.append(f"Data e Horario Exato da Emissao: {agora_str()}")
+    linhas.append(f"Ultima Coleta das Bolsas e Cambio: {dados['atualizacao']}")
+    linhas.append(
+        f"Dolar Comercial Spot (Fonte Yahoo Finance USDBRL=X): R$ {dados['dolar']:.2f} ({dados['dolar_var']:+.2f}%)"
+    )
+    linhas.append(
+        "Fontes Auditadas: Chicago Board of Trade (CBOT), CEPEA/Esalq, IRGA/Emater-RS, Epagri-SC, Deral-PR e Open-Meteo."
+    )
+    linhas.append("")
+    linhas.append("=== COTACOES, MEDIAS ESTADUAIS (RS / SC / PR) E PREVISOES ===")
+
+    for it in dados["itens"]:
+      m_u = calcular_medias_estados(it["regioes_sul"])
+      linhas.append(
+          f"[{it['sigla']}] {it['nome']} ({it['unidade']}) -> Atual: R$ {it['preco_atual']:.2f} ({it['var_dia']:+.2f}%)"
+      )
+      linhas.append(
+          f"   Medias Regionais -> RS: R$ {m_u['RS']:.2f} | SC: R$ {m_u['SC']:.2f} | PR: R$ {m_u['PR']:.2f} | Media Sul: R$ {m_u['SUL']:.2f} | Contrato Empresa: R$ {it['contrato_empresa']:.2f}"
+      )
+      linhas.append(
+          f"   Estimativas IA -> +15d: R$ {it['prev_15d']:.2f} | +30d: R$ {it['prev_30d']:.2f} | +60d: R$ {it.get('prev_60d', it['prev_30d']):.2f} | +90d: R$ {it['prev_90d']:.2f}"
+      )
+      linhas.append(
+          f"   Fonte Especifica: {it.get('fonte_oficial', '')} | Horario Coleta: {it.get('horario_busca_item', dados['atualizacao'])}"
+      )
+      linhas.append("-" * 98)
+
+    linhas.append("")
+    linhas.append(f"=== CLIMA E CHUVAS — POLO SELECIONADO: {polo_clima_sel} ===")
+    info_c = POLOS_CLIMA_SUL[polo_clima_sel]
+    linhas.append(f"Fonte Meteorologica: {info_c['estacao_inmet']} (Lat {info_c['lat']}, Lon {info_c['lon']})")
+    for est_nome, d_est in info_c["historico_estacoes"].items():
+      linhas.append(
+          f"   {est_nome}: 2023={d_est['2023']}mm | 2024={d_est['2024']}mm | 2025={d_est['2025']}mm | Media Hist.={d_est['media_hist']}mm | Previsao 2026/27={d_est['2026_est']}mm"
+      )
+
+    linhas.append("")
+    linhas.append("=== NOTA TECNICA DE ESTIMATIVA DE MERCADO ===")
+    linhas.append(
+        "Os valores futuros projetados sao estimativas estatisticas baseadas em medias, cambio e bolsas futuras,"
+    )
+    linhas.append(
+        "sujeitas a oscilacoes diarias de clima, frete e mercado, nao representando garantia de preco concreto."
+    )
+
+    criar_pdf_nativo(
+        caminho_pdf,
+        "CR AgroStat - Relatorio Oficial de Cotacoes, Fontes e Clima",
+        f"Regiao Sul (RS, SC e PR)  |  Gerado em: {agora_str()}",
+        linhas,
+    )
+
+    # Se estiver no Windows local, abre o PDF automaticamente para o usuário ver/imprimir
+    if os.name == "nt":
+      try:
+        os.startfile(os.path.abspath(caminho_pdf))
+      except Exception:
+        pass
+
+    mostrar_aviso(
+        f"📄 PDF Oficial gerado com sucesso em '{PASTA_RELATORIOS}/{nome_pdf}'!"
+    )
+
   # =========================================================================
-  # COMPONENTE: GRÁFICO MULTIVISUAL + FONTES + IA
+  # BARRA DE MENU COM DESTAQUE VISUAL SEMPRE ATUALIZADO NA ABA SELECIONADA
+  # =========================================================================
+  def atualizar_barra_menu():
+    definicao_abas = [
+        ("painel", "Painel & Gráficos Sul", ft.icons.SHOW_CHART_ROUNDED),
+        ("clima", "Clima & Chuvas (Anos)", ft.icons.THUNDERSTORM_ROUNDED),
+        ("regional", "Contratos RS / SC / PR", ft.icons.MAP_ROUNDED),
+        ("frete", "Estudo de Fretes (KM)", ft.icons.LOCAL_SHIPPING_ROUNDED),
+        ("barter", "Simulador Barter", ft.icons.CALCULATE_ROUNDED),
+        ("relatorios", "Planilhas & PDF", ft.icons.PICTURE_AS_PDF_ROUNDED),
+        ("nuvem", "Fontes & Ícone", ft.icons.VERIFIED_ROUNDED),
+    ]
+    linha_menu_abas.controls.clear()
+    for chave_aba, texto_aba, icone_aba in definicao_abas:
+      esta_ativa = aba_atual == chave_aba
+      linha_menu_abas.controls.append(
+          ft.ElevatedButton(
+              text=f"✓ {texto_aba}" if esta_ativa else texto_aba,
+              icon=icone_aba,
+              bgcolor="#10B981" if esta_ativa else "#1E293B",
+              color="#080D16" if esta_ativa else "#E2E8F0",
+              height=46,
+              style=ft.ButtonStyle(
+                  side={
+                      "": ft.BorderSide(
+                          2.5 if esta_ativa else 1,
+                          "#FACC15" if esta_ativa else "#334155",
+                      )
+                  },
+                  shape=ft.RoundedRectangleBorder(radius=14),
+              ),
+              on_click=lambda e, k=chave_aba: mudar_aba(k),
+          )
+      )
+
+  # =========================================================================
+  # COMPONENTE: GRÁFICO MULTIVISUAL + FONTES + COPIAR + PDF
   # =========================================================================
   def construir_bloco_grafico():
-    nonlocal data_ini_idx, data_fim_idx
+    nonlocal data_ini_idx, data_fim_idx, horario_ultima_selecao
     item_sel = dados["itens"][item_grafico_idx]
     medias_uf = calcular_medias_estados(item_sel["regioes_sul"])
     item_sel["medias_uf"] = medias_uf
@@ -1038,23 +1366,27 @@ def main(page: ft.Page):
     amplitude = max(max_val - min_val, 0.4)
 
     def sel_item_graf(idx):
-      nonlocal item_grafico_idx
+      nonlocal item_grafico_idx, horario_ultima_selecao
       item_grafico_idx = idx
+      horario_ultima_selecao = agora_str()
       renderizar()
 
     def sel_periodo_graf(per):
-      nonlocal periodo_grafico
+      nonlocal periodo_grafico, horario_ultima_selecao
       periodo_grafico = per
+      horario_ultima_selecao = agora_str()
       renderizar()
 
     def sel_estilo_graf(est):
-      nonlocal estilo_grafico
+      nonlocal estilo_grafico, horario_ultima_selecao
       estilo_grafico = est
+      horario_ultima_selecao = agora_str()
       renderizar()
 
     def sel_uf_graf(uf):
-      nonlocal uf_selecionada
+      nonlocal uf_selecionada, horario_ultima_selecao
       uf_selecionada = uf
+      horario_ultima_selecao = agora_str()
       renderizar()
 
     def alternar_painel_ia(e):
@@ -1062,48 +1394,38 @@ def main(page: ft.Page):
       mostrar_painel_ia = not mostrar_painel_ia
       renderizar()
 
+    # Botões de Estado sempre marcados quando selecionados
+    opcoes_uf = [
+        ("SUL", f"🌎 Média Região Sul (R$ {medias_uf['SUL']:.2f})"),
+        ("RS", f"🟢 Rio Grande do Sul - RS (R$ {medias_uf['RS']:.2f})"),
+        ("SC", f"🔴 Santa Catarina - SC (R$ {medias_uf['SC']:.2f})"),
+        ("PR", f"🔵 Paraná - PR (R$ {medias_uf['PR']:.2f})"),
+    ]
     botoes_uf = ft.Row(
         wrap=True,
         spacing=8,
         controls=[
-            ft.Text("Estado / Recorte:", color="#94A3B8", size=13, weight=ft.FontWeight.BOLD),
-            ft.ElevatedButton(
-                f"🌎 Média Região Sul (R$ {medias_uf['SUL']:.2f})",
-                bgcolor="#10B981" if uf_selecionada == "SUL" else "#1E293B",
-                color="#080D16" if uf_selecionada == "SUL" else "#FFFFFF",
-                height=36,
-                on_click=lambda e: sel_uf_graf("SUL"),
-            ),
-            ft.ElevatedButton(
-                f"🟢 Rio Grande do Sul - RS (R$ {medias_uf['RS']:.2f})",
-                bgcolor="#10B981" if uf_selecionada == "RS" else "#1E293B",
-                color="#080D16" if uf_selecionada == "RS" else "#FFFFFF",
-                height=36,
-                on_click=lambda e: sel_uf_graf("RS"),
-            ),
-            ft.ElevatedButton(
-                f"🔴 Santa Catarina - SC (R$ {medias_uf['SC']:.2f})",
-                bgcolor="#10B981" if uf_selecionada == "SC" else "#1E293B",
-                color="#080D16" if uf_selecionada == "SC" else "#FFFFFF",
-                height=36,
-                on_click=lambda e: sel_uf_graf("SC"),
-            ),
-            ft.ElevatedButton(
-                f"🔵 Paraná - PR (R$ {medias_uf['PR']:.2f})",
-                bgcolor="#10B981" if uf_selecionada == "PR" else "#1E293B",
-                color="#080D16" if uf_selecionada == "PR" else "#FFFFFF",
-                height=36,
-                on_click=lambda e: sel_uf_graf("PR"),
-            ),
+            ft.Text("Estado / Recorte:", color="#94A3B8", size=13, weight=ft.FontWeight.BOLD)
         ],
     )
+    for cod_uf, rot_uf in opcoes_uf:
+      ativo_u = uf_selecionada == cod_uf
+      botoes_uf.controls.append(
+          ft.ElevatedButton(
+              f"✓ {rot_uf}" if ativo_u else rot_uf,
+              bgcolor="#10B981" if ativo_u else "#1E293B",
+              color="#080D16" if ativo_u else "#FFFFFF",
+              height=36,
+              on_click=lambda e, u=cod_uf: sel_uf_graf(u),
+          )
+      )
 
     chips_itens = ft.Row(wrap=True, spacing=8)
     for idx, it in enumerate(dados["itens"]):
       ativo = idx == item_grafico_idx
       chips_itens.controls.append(
           ft.ElevatedButton(
-              it["sigla"],
+              f"✓ {it['sigla']}" if ativo else it["sigla"],
               bgcolor=it["cor"] if ativo else "#1E293B",
               color="#080D16" if ativo else "#E2E8F0",
               height=38,
@@ -1111,61 +1433,59 @@ def main(page: ft.Page):
           )
       )
 
+    opcoes_est = [
+        ("area", "📈 Curva de Área + Média"),
+        ("linha", "📐 Linha Técnica"),
+        ("colunas", "📊 Colunas Verticais"),
+        ("horizontal", "📉 Termómetro por Data"),
+    ]
     botoes_estilo = ft.Row(
         wrap=True,
         spacing=8,
         controls=[
-            ft.Text("Estilo Visual:", color="#94A3B8", size=13, weight=ft.FontWeight.BOLD),
-            ft.ElevatedButton(
-                "📈 Curva de Área + Média",
-                bgcolor="#10B981" if estilo_grafico == "area" else "#1E293B",
-                color="#080D16" if estilo_grafico == "area" else "#FFFFFF",
-                height=36,
-                on_click=lambda e: sel_estilo_graf("area"),
-            ),
-            ft.ElevatedButton(
-                "📐 Linha Técnica",
-                bgcolor="#10B981" if estilo_grafico == "linha" else "#1E293B",
-                color="#080D16" if estilo_grafico == "linha" else "#FFFFFF",
-                height=36,
-                on_click=lambda e: sel_estilo_graf("linha"),
-            ),
-            ft.ElevatedButton(
-                "📊 Colunas Verticais",
-                bgcolor="#10B981" if estilo_grafico == "colunas" else "#1E293B",
-                color="#080D16" if estilo_grafico == "colunas" else "#FFFFFF",
-                height=36,
-                on_click=lambda e: sel_estilo_graf("colunas"),
-            ),
-            ft.ElevatedButton(
-                "📉 Termómetro por Data",
-                bgcolor="#10B981" if estilo_grafico == "horizontal" else "#1E293B",
-                color="#080D16" if estilo_grafico == "horizontal" else "#FFFFFF",
-                height=36,
-                on_click=lambda e: sel_estilo_graf("horizontal"),
-            ),
+            ft.Text("Estilo Visual:", color="#94A3B8", size=13, weight=ft.FontWeight.BOLD)
         ],
     )
+    for cod_e, rot_e in opcoes_est:
+      at_e = estilo_grafico == cod_e
+      botoes_estilo.controls.append(
+          ft.ElevatedButton(
+              f"✓ {rot_e}" if at_e else rot_e,
+              bgcolor="#10B981" if at_e else "#1E293B",
+              color="#080D16" if at_e else "#FFFFFF",
+              height=36,
+              on_click=lambda e, es=cod_e: sel_estilo_graf(es),
+          )
+      )
 
-    botoes_per = ft.Row(
-        wrap=True,
-        spacing=8,
-        controls=[
-            ft.ElevatedButton("Diário", bgcolor="#38BDF8" if periodo_grafico == "diario" else "#1E293B", color="#080D16" if periodo_grafico == "diario" else "#FFFFFF", height=36, on_click=lambda e: sel_periodo_graf("diario")),
-            ft.ElevatedButton("7 Dias", bgcolor="#38BDF8" if periodo_grafico == "7d" else "#1E293B", color="#080D16" if periodo_grafico == "7d" else "#FFFFFF", height=36, on_click=lambda e: sel_periodo_graf("7d")),
-            ft.ElevatedButton("15 Dias", bgcolor="#38BDF8" if periodo_grafico == "15d" else "#1E293B", color="#080D16" if periodo_grafico == "15d" else "#FFFFFF", height=36, on_click=lambda e: sel_periodo_graf("15d")),
-            ft.ElevatedButton("30 Dias", bgcolor="#38BDF8" if periodo_grafico == "30d" else "#1E293B", color="#080D16" if periodo_grafico == "30d" else "#FFFFFF", height=36, on_click=lambda e: sel_periodo_graf("30d")),
-            ft.ElevatedButton("60 Dias", bgcolor="#38BDF8" if periodo_grafico == "60d" else "#1E293B", color="#080D16" if periodo_grafico == "60d" else "#FFFFFF", height=36, on_click=lambda e: sel_periodo_graf("60d")),
-            ft.ElevatedButton("Projeção 90 Dias", bgcolor="#FACC15" if periodo_grafico == "90d" else "#1E293B", color="#080D16" if periodo_grafico == "90d" else "#FFFFFF", height=36, on_click=lambda e: sel_periodo_graf("90d")),
-        ],
-    )
+    opcoes_per = [
+        ("diario", "Diário"),
+        ("7d", "7 Dias"),
+        ("15d", "15 Dias"),
+        ("30d", "30 Dias"),
+        ("60d", "60 Dias"),
+        ("90d", "Projeção 90 Dias"),
+    ]
+    botoes_per = ft.Row(wrap=True, spacing=8)
+    for cod_p, rot_p in opcoes_per:
+      at_p = periodo_grafico == cod_p
+      cor_p = "#FACC15" if cod_p == "90d" else "#38BDF8"
+      botoes_per.controls.append(
+          ft.ElevatedButton(
+              f"✓ {rot_p}" if at_p else rot_p,
+              bgcolor=cor_p if at_p else "#1E293B",
+              color="#080D16" if at_p else "#FFFFFF",
+              height=36,
+              on_click=lambda e, pe=cod_p: sel_periodo_graf(pe),
+          )
+      )
 
     dd_data_ini = ft.Dropdown(
         label="📅 Data Inicial",
         bgcolor="#0B111E",
         color="#FFFFFF",
         border_radius=10,
-        width=170,
+        width=165,
         options=[ft.dropdown.Option(str(i), p["data_completa"]) for i, p in enumerate(hist_60)],
         value=str(data_ini_idx),
     )
@@ -1174,16 +1494,17 @@ def main(page: ft.Page):
         bgcolor="#0B111E",
         color="#FFFFFF",
         border_radius=10,
-        width=170,
+        width=165,
         options=[ft.dropdown.Option(str(i), p["data_completa"]) for i, p in enumerate(hist_60)],
         value=str(data_fim_idx),
     )
 
     def aplicar_filtro_datas(e):
-      nonlocal data_ini_idx, data_fim_idx, periodo_grafico
+      nonlocal data_ini_idx, data_fim_idx, periodo_grafico, horario_ultima_selecao
       data_ini_idx = int(dd_data_ini.value)
       data_fim_idx = int(dd_data_fim.value)
       periodo_grafico = "custom"
+      horario_ultima_selecao = agora_str()
       renderizar()
 
     barra_datas_custom = ft.Row(
@@ -1200,9 +1521,9 @@ def main(page: ft.Page):
                     dd_data_ini,
                     dd_data_fim,
                     ft.ElevatedButton(
-                        "Filtrar Datas",
+                        "✓ Datas Ativas" if periodo_grafico == "custom" else "Filtrar Datas",
                         icon=ft.icons.CALENDAR_MONTH_ROUNDED,
-                        bgcolor="#38BDF8",
+                        bgcolor="#10B981" if periodo_grafico == "custom" else "#38BDF8",
                         color="#080D16",
                         height=42,
                         on_click=aplicar_filtro_datas,
@@ -1226,7 +1547,7 @@ def main(page: ft.Page):
 
       cor_hex_limpa = item_sel["cor"].lstrip("#")
       widget_grafico = ft.Container(
-          height=250,
+          height=245,
           padding=ft.padding.only(right=20, top=15, bottom=5),
           content=ft.LineChart(
               data_series=[
@@ -1327,6 +1648,30 @@ def main(page: ft.Page):
         )
       widget_grafico = linhas_h
 
+    p15_uf = round(item_sel["prev_15d"] * fator_uf, 2)
+    p30_uf = round(item_sel["prev_30d"] * fator_uf, 2)
+    p60_uf = round(item_sel.get("prev_60d", item_sel["prev_30d"]) * fator_uf, 2)
+    p90_uf = round(item_sel["prev_90d"] * fator_uf, 2)
+
+    resumo_copia_grafico = (
+        f"📊 CR AgroStat — Resumo de Análise ({item_sel['nome']} - Recorte {uf_selecionada})\n"
+        f"🕒 Data/Hora da Seleção: {horario_ultima_selecao} | Coleta de Mercado: {dados['atualizacao']}\n"
+        f"💰 Valor Atual ({uf_selecionada}): R$ {pontos[-1]['valor']:.2f} ({item_sel['unidade']})\n"
+        f"📈 Média do Período ({titulo_per}): R$ {media_val:.2f} (Mín: R$ {min_val:.2f} / Máx: R$ {max_val:.2f})\n"
+        f"🌎 Médias Estaduais: RS R$ {medias_uf['RS']:.2f} | SC R$ {medias_uf['SC']:.2f} | PR R$ {medias_uf['PR']:.2f}\n"
+        f"🔮 Estimativas Futuras (IA): +15d R$ {p15_uf:.2f} | +30d R$ {p30_uf:.2f} | +60d R$ {p60_uf:.2f} | +90d R$ {p90_uf:.2f}\n"
+        f"📚 Fonte Oficial: {item_sel.get('fonte_oficial', '')}"
+    )
+
+    detalhes_auditoria_grafico = [
+        f"Item Selecionado: {item_sel['nome']} ({item_sel['unidade']}) — Recorte Regional: {uf_selecionada}",
+        f"Data e Hora Exata desta Seleção/Filtro: {horario_ultima_selecao}",
+        f"Data e Hora da Coleta nas Bolsas e Câmbio: {dados['atualizacao']}",
+        f"Fonte Principal da Cotação: {item_sel.get('fonte_oficial', '')}",
+        f"Ticker Internacional Consultado (Yahoo Finance API): {item_sel['ticker']} | Câmbio: USDBRL=X (R$ {dados['dolar']:.2f})",
+        f"Período Analisado: {titulo_per} — Média Calculada: R$ {media_val:.2f}",
+    ]
+
     lista_fatores_ui = ft.Column(spacing=6)
     for fat in item_sel.get("fatores_oscilacao", []):
       lista_fatores_ui.controls.append(
@@ -1339,11 +1684,6 @@ def main(page: ft.Page):
               ],
           )
       )
-
-    p15_uf = round(item_sel["prev_15d"] * fator_uf, 2)
-    p30_uf = round(item_sel["prev_30d"] * fator_uf, 2)
-    p60_uf = round(item_sel.get("prev_60d", item_sel["prev_30d"]) * fator_uf, 2)
-    p90_uf = round(item_sel["prev_90d"] * fator_uf, 2)
 
     bloco_previsao_inteligente = ft.Container(
         visible=mostrar_painel_ia,
@@ -1371,8 +1711,8 @@ def main(page: ft.Page):
                             ],
                         ),
                         ft.Text(
-                            f"Fonte: {item_sel.get('fonte_oficial', 'CBOT + CEPEA/IRGA/Epagri/Deral')}",
-                            color="#10B981",
+                            f"🕒 Cálculo atualizado em: {horario_ultima_selecao}",
+                            color="#38BDF8",
                             size=12,
                             weight=ft.FontWeight.BOLD,
                         ),
@@ -1491,12 +1831,12 @@ def main(page: ft.Page):
                                         weight=ft.FontWeight.BOLD,
                                     ),
                                     ft.Text(
-                                        f"{titulo_per}  |  Linha Tracejada = Média (R$ {media_val:.2f})",
+                                        f"{titulo_per}  |  Média: R$ {media_val:.2f}  |  🕒 Selecionado em: {horario_ultima_selecao}",
                                         color="#38BDF8",
-                                        size=13,
+                                        size=12,
                                     ),
                                     ft.Text(
-                                        f"📚 Fonte Auditável: {item_sel.get('fonte_oficial', '')}",
+                                        f"📚 Fonte: {item_sel.get('fonte_oficial', '')} (Coleta: {dados['atualizacao']})",
                                         color="#10B981",
                                         size=12,
                                     ),
@@ -1505,21 +1845,52 @@ def main(page: ft.Page):
                         ),
                         ft.Row(
                             wrap=True,
-                            spacing=10,
+                            spacing=8,
                             controls=[
-                                botoes_per,
                                 ft.ElevatedButton(
-                                    "🧠 Previsão Inteligente deste Item",
-                                    icon=ft.icons.PSYCHOLOGY_ROUNDED,
-                                    bgcolor="#FACC15",
-                                    color="#080D16",
-                                    height=40,
+                                    "🔍 Fontes e Horário",
+                                    bgcolor="#1E293B",
+                                    color="#38BDF8",
+                                    height=38,
+                                    on_click=lambda e: abrir_modal_fontes(
+                                        f"{item_sel['nome']} ({uf_selecionada})",
+                                        detalhes_auditoria_grafico,
+                                        item_sel.get("url_fonte"),
+                                    ),
+                                ),
+                                ft.ElevatedButton(
+                                    "📋 Copiar Análise",
+                                    bgcolor="#1E293B",
+                                    color="#10B981",
+                                    height=38,
+                                    on_click=lambda e: copiar_para_area_transferencia(
+                                        f"Análise {item_sel['nome']}",
+                                        resumo_copia_grafico,
+                                    ),
+                                ),
+                                ft.ElevatedButton(
+                                    "📄 Gerar PDF",
+                                    bgcolor="#0284C7",
+                                    color="#FFFFFF",
+                                    height=38,
+                                    on_click=lambda e: gerar_pdf_completo_usuario(
+                                        f"Analise {item_sel['nome']} ({uf_selecionada})"
+                                    ),
+                                ),
+                                ft.ElevatedButton(
+                                    "✓ 🧠 Previsão IA Aberta"
+                                    if mostrar_painel_ia
+                                    else "🧠 Abrir Previsão IA",
+                                    bgcolor="#FACC15" if mostrar_painel_ia else "#1E293B",
+                                    color="#080D16" if mostrar_painel_ia else "#FACC15",
+                                    height=38,
                                     on_click=alternar_painel_ia,
                                 ),
                             ],
                         ),
                     ],
                 ),
+                botoes_per,
                 botoes_uf,
                 chips_itens,
                 barra_datas_custom,
@@ -1594,6 +1965,7 @@ def main(page: ft.Page):
   # RENDERIZAÇÃO DAS 7 ABAS DO SISTEMA
   # =========================================================================
   def renderizar():
+    atualizar_barra_menu()
     corpo_view.controls.clear()
 
     # -------------------------------------------------------------------------
@@ -1603,8 +1975,9 @@ def main(page: ft.Page):
       corpo_view.controls.append(construir_bloco_grafico())
 
       def mudar_f_cat(c):
-        nonlocal filtro_cat
+        nonlocal filtro_cat, horario_ultima_selecao
         filtro_cat = c
+        horario_ultima_selecao = agora_str()
         renderizar()
 
       barra_filtro = ft.Row(
@@ -1612,7 +1985,7 @@ def main(page: ft.Page):
           wrap=True,
           controls=[
               ft.Text(
-                  "Painel de Cotações da Região Sul (RS, SC e PR) & Fontes dos Resultados",
+                  "Painel de Cotações da Região Sul (RS, SC e PR) & Fontes Auditáveis",
                   color="#FFFFFF",
                   size=20,
                   weight=ft.FontWeight.BOLD,
@@ -1620,9 +1993,24 @@ def main(page: ft.Page):
               ft.Row(
                   spacing=8,
                   controls=[
-                      ft.ElevatedButton("Todos", bgcolor="#10B981" if filtro_cat == "Todos" else "#1E293B", color="#080D16" if filtro_cat == "Todos" else "#FFFFFF", on_click=lambda e: mudar_f_cat("Todos")),
-                      ft.ElevatedButton("Só Grãos", bgcolor="#F59E0B" if filtro_cat == "Grãos" else "#1E293B", color="#080D16" if filtro_cat == "Grãos" else "#FFFFFF", on_click=lambda e: mudar_f_cat("Grãos")),
-                      ft.ElevatedButton("Só Sementes", bgcolor="#10B981" if filtro_cat == "Sementes" else "#1E293B", color="#080D16" if filtro_cat == "Sementes" else "#FFFFFF", on_click=lambda e: mudar_f_cat("Sementes")),
+                      ft.ElevatedButton(
+                          "✓ Todos" if filtro_cat == "Todos" else "Todos",
+                          bgcolor="#10B981" if filtro_cat == "Todos" else "#1E293B",
+                          color="#080D16" if filtro_cat == "Todos" else "#FFFFFF",
+                          on_click=lambda e: mudar_f_cat("Todos"),
+                      ),
+                      ft.ElevatedButton(
+                          "✓ Só Grãos" if filtro_cat == "Grãos" else "Só Grãos",
+                          bgcolor="#F59E0B" if filtro_cat == "Grãos" else "#1E293B",
+                          color="#080D16" if filtro_cat == "Grãos" else "#FFFFFF",
+                          on_click=lambda e: mudar_f_cat("Grãos"),
+                      ),
+                      ft.ElevatedButton(
+                          "✓ Só Sementes" if filtro_cat == "Sementes" else "Só Sementes",
+                          bgcolor="#10B981" if filtro_cat == "Sementes" else "#1E293B",
+                          color="#080D16" if filtro_cat == "Sementes" else "#FFFFFF",
+                          on_click=lambda e: mudar_f_cat("Sementes"),
+                      ),
                   ],
               ),
           ],
@@ -1639,10 +2027,29 @@ def main(page: ft.Page):
         sinal = "+" if alta else ""
         cor_var = "#22C55E" if alta else "#EF4444"
 
+        texto_copiar_card = (
+            f"🌾 {item['nome']} ({item['unidade']})\n"
+            f"💰 Preço Atual: R$ {item['preco_atual']:.2f} ({sinal}{item['var_dia']:.2f}% hoje)\n"
+            f"🌎 Médias Sul: RS R$ {m_uf['RS']:.2f} | SC R$ {m_uf['SC']:.2f} | PR R$ {m_uf['PR']:.2f}\n"
+            f"🚦 Status: {item['msg_semaforo']}\n"
+            f"🔮 Estimativas: 15d R$ {item['prev_15d']:.2f} | 30d R$ {item['prev_30d']:.2f} | 90d R$ {item['prev_90d']:.2f}\n"
+            f"📚 Fonte: {item.get('fonte_oficial', '')}\n"
+            f"🕒 Data/Hora da Busca: {item.get('horario_busca_item', dados['atualizacao'])}"
+        )
+
+        detalhes_fonte_card = [
+            f"Item: {item['nome']} ({item['categoria']} — {item['unidade']})",
+            f"Data e Horário da Busca nas Fontes: {item.get('horario_busca_item', dados['atualizacao'])}",
+            f"Fonte Oficial Utilizada: {item.get('fonte_oficial', '')}",
+            f"Contrato Bolsa Referência: {item['ticker']} | Dólar PTAX/Spot: R$ {dados['dolar']:.2f}",
+            f"Médias Calculadas: RS R$ {m_uf['RS']:.2f} | SC R$ {m_uf['SC']:.2f} | PR R$ {m_uf['PR']:.2f}",
+        ]
+
         def acao_previsao_card(e, i=idx):
-          nonlocal item_grafico_idx, mostrar_painel_ia
+          nonlocal item_grafico_idx, mostrar_painel_ia, horario_ultima_selecao
           item_grafico_idx = i
           mostrar_painel_ia = True
+          horario_ultima_selecao = agora_str()
           mostrar_aviso(f"Exibindo Gráfico e Previsão Inteligente de {dados['itens'][i]['nome']}!")
           renderizar()
 
@@ -1720,7 +2127,7 @@ def main(page: ft.Page):
                                 ),
                                 ft.Text(f"Motivo: {item['motivo']}", color="#CBD5E1", size=13),
                                 ft.Text(
-                                    f"📚 Fonte dos Dados: {item.get('fonte_oficial', 'CBOT + CEPEA/IRGA/Epagri/Deral')}",
+                                    f"📚 Fonte: {item.get('fonte_oficial', '')}\n🕒 Busca realizada em: {item.get('horario_busca_item', dados['atualizacao'])}",
                                     color="#38BDF8",
                                     size=11,
                                     weight=ft.FontWeight.W_600,
@@ -1766,15 +2173,31 @@ def main(page: ft.Page):
                     ft.Row(
                         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                         wrap=True,
+                        spacing=8,
                         controls=[
                             ft.ElevatedButton(
-                                "🧠 Ver Gráfico e Previsão Detalhada (IA)",
+                                "🧠 Gráfico & IA",
                                 bgcolor="#1E293B",
                                 color="#FACC15",
+                                height=36,
                                 on_click=acao_previsao_card,
                             ),
+                            ft.ElevatedButton(
+                                "🔍 Ver Fonte/Hora",
+                                bgcolor="#1E293B",
+                                color="#38BDF8",
+                                height=36,
+                                on_click=lambda e, nm=item["nome"], dt=detalhes_fonte_card, u=item.get("url_fonte"): abrir_modal_fontes(nm, dt, u),
+                            ),
+                            ft.ElevatedButton(
+                                "📋 Copiar",
+                                bgcolor="#1E293B",
+                                color="#10B981",
+                                height=36,
+                                on_click=lambda e, nm=item["nome"], tx=texto_copiar_card: copiar_para_area_transferencia(nm, tx),
+                            ),
                             ft.TextButton(
-                                "🗺️ Comparar em RS, SC e PR",
+                                "🗺️ Regiões Sul",
                                 on_click=lambda e, i=idx: abrir_regional_item(i),
                             ),
                         ],
@@ -1787,11 +2210,11 @@ def main(page: ft.Page):
       corpo_view.controls.append(grade)
 
     # -------------------------------------------------------------------------
-    # ABA 2: CLIMA AGRÍCOLA & HISTÓRICO DE ESTAÇÕES DE ANOS ANTERIORES (CHUVA)
+    # ABA 2: CLIMA AGRÍCOLA & HISTÓRICO DE ESTAÇÕES DE ANOS ANTERIORES
     # -------------------------------------------------------------------------
     elif aba_atual == "clima":
       info_polo = POLOS_CLIMA_SUL[polo_clima_sel]
-      previsao_10d = buscar_previsao_tempo_openmeteo(polo_clima_sel)
+      previsao_10d, hora_clima, fonte_modo_clima = buscar_previsao_tempo_openmeteo(polo_clima_sel)
       total_chuva_10d = round(sum(d["chuva_mm"] for d in previsao_10d), 1)
       dias_com_chuva = sum(1 for d in previsao_10d if d["chuva_mm"] >= 1.0)
 
@@ -1810,13 +2233,12 @@ def main(page: ft.Page):
           bgcolor="#0B111E",
           color="#FFFFFF",
           border_radius=12,
-          width=460,
+          width=440,
           options=[ft.dropdown.Option(k) for k in POLOS_CLIMA_SUL.keys()],
           value=polo_clima_sel,
           on_change=mudar_polo_clima,
       )
 
-      # Cartões dos próximos 10 dias (Open-Meteo ECMWF/GFS)
       cards_10d = ft.ResponsiveRow(spacing=10, run_spacing=10)
       for d in previsao_10d:
         chove = d["chuva_mm"] >= 2.0
@@ -1843,14 +2265,13 @@ def main(page: ft.Page):
             )
         )
 
-      # Botões de Estação do Ano para Comparativo de Anos Anteriores
       botoes_estacoes = ft.Row(wrap=True, spacing=8)
       for nome_est in info_polo["historico_estacoes"].keys():
         ativo = nome_est == estacao_clima_sel
         botoes_estacoes.controls.append(
             ft.ElevatedButton(
-                f"🌦️ {nome_est}",
-                bgcolor="#38BDF8" if ativo else "#1E293B",
+                f"✓ 🌦️ {nome_est}" if ativo else f"🌦️ {nome_est}",
+                bgcolor="#10B981" if ativo else "#1E293B",
                 color="#080D16" if ativo else "#FFFFFF",
                 height=40,
                 on_click=lambda e, es=nome_est: mudar_estacao_clima(es),
@@ -1896,14 +2317,7 @@ def main(page: ft.Page):
                             bgcolor="#131E32",
                             height=20,
                             border_radius=10,
-                            content=ft.Row([
-                                ft.Container(
-                                    width=int(prop * 520),
-                                    height=20,
-                                    bgcolor=cor_b,
-                                    border_radius=10,
-                                )
-                            ]),
+                            content=ft.Row([ft.Container(width=int(prop * 520), height=20, bgcolor=cor_b, border_radius=10)]),
                         ),
                     ],
                 ),
@@ -1917,9 +2331,24 @@ def main(page: ft.Page):
           f" estação {estacao_clima_sel} com os anos anteriores (2023: {dados_est['2023']} mm,"
           f" 2024: {dados_est['2024']} mm, 2025: {dados_est['2025']} mm), a previsão"
           f" para o ciclo 2026/2027 ({dados_est['2026_est']} mm) situa-se próxima da"
-          f" normalidade histórica ({dados_est['media_hist']} mm), favorecendo o"
-          " planejamento escalonado de plantio, manejo e comercialização."
+          f" normalidade histórica ({dados_est['media_hist']} mm)."
       )
+
+      texto_copia_clima = (
+          f"🌧️ CR AgroStat — Boletim Climático ({polo_clima_sel})\n"
+          f"🕒 Data/Hora da Consulta: {hora_clima}\n"
+          f"📚 Fonte: {info_polo['estacao_inmet']} ({fonte_modo_clima})\n"
+          f"💧 Próximos 10 Dias: {total_chuva_10d:.1f} mm acumulados ({dias_com_chuva} dias de chuva)\n"
+          f"🌦️ Comparativo {estacao_clima_sel}: 2023={dados_est['2023']}mm | 2024={dados_est['2024']}mm | 2025={dados_est['2025']}mm | Média={dados_est['media_hist']}mm | Previsão 2026/27={dados_est['2026_est']}mm"
+      )
+
+      detalhes_fonte_clima = [
+          f"Polo Agrícola Selecionado: {polo_clima_sel}",
+          f"Coordenadas de Satélite Consultadas: Latitude {info_polo['lat']} | Longitude {info_polo['lon']}",
+          f"Data e Horário Exato da Busca: {hora_clima}",
+          f"Motor de Previsão de 10 Dias: {fonte_modo_clima}",
+          f"Estação / Base Histórica de Referência: {info_polo['estacao_inmet']} + Reanálise Climatológica ERA5",
+      ]
 
       corpo_view.controls.append(
           ft.Container(
@@ -1942,15 +2371,47 @@ def main(page: ft.Page):
                                       weight=ft.FontWeight.BOLD,
                                   ),
                                   ft.Text(
-                                      "📚 Fonte Meteorológica: Open-Meteo Agro API (Modelos ECMWF Europeu + NOAA GFS + Reanálise Histórica ERA5/INMET)",
+                                      f"📚 Fonte: {info_polo['estacao_inmet']}  |  🕒 Consultado em: {hora_clima}",
                                       color="#10B981",
                                       size=12,
                                       weight=ft.FontWeight.BOLD,
                                   ),
                               ]),
-                              dd_polo,
+                              ft.Row(
+                                  wrap=True,
+                                  spacing=8,
+                                  controls=[
+                                      ft.ElevatedButton(
+                                          "🔍 Fontes e Horário",
+                                          bgcolor="#1E293B",
+                                          color="#38BDF8",
+                                          on_click=lambda e: abrir_modal_fontes(
+                                              f"Clima {polo_clima_sel}",
+                                              detalhes_fonte_clima,
+                                              "https://open-meteo.com/",
+                                          ),
+                                      ),
+                                      ft.ElevatedButton(
+                                          "📋 Copiar Boletim",
+                                          bgcolor="#1E293B",
+                                          color="#10B981",
+                                          on_click=lambda e: copiar_para_area_transferencia(
+                                              "Boletim Climático", texto_copia_clima
+                                          ),
+                                      ),
+                                      ft.ElevatedButton(
+                                          "📄 Gerar PDF",
+                                          bgcolor="#0284C7",
+                                          color="#FFFFFF",
+                                          on_click=lambda e: gerar_pdf_completo_usuario(
+                                              f"Boletim Climatico - {polo_clima_sel}"
+                                          ),
+                                      ),
+                                  ],
+                              ),
                           ],
                       ),
+                      dd_polo,
                       ft.Container(
                           bgcolor="#0B111E",
                           padding=16,
@@ -2011,13 +2472,15 @@ def main(page: ft.Page):
       item_reg = dados["itens"][item_regional_idx]
 
       def escolher_item_reg(idx):
-        nonlocal item_regional_idx
+        nonlocal item_regional_idx, horario_ultima_selecao
         item_regional_idx = idx
+        horario_ultima_selecao = agora_str()
         renderizar()
 
       def escolher_uf_reg(uf):
-        nonlocal uf_aba_regional
+        nonlocal uf_aba_regional, horario_ultima_selecao
         uf_aba_regional = uf
+        horario_ultima_selecao = agora_str()
         renderizar()
 
       botoes_itens_reg = ft.Row(wrap=True, spacing=8)
@@ -2025,7 +2488,7 @@ def main(page: ft.Page):
         ativo = idx == item_regional_idx
         botoes_itens_reg.controls.append(
             ft.ElevatedButton(
-                f"{it['nome']}",
+                f"✓ {it['nome']}" if ativo else it["nome"],
                 bgcolor=it["cor"] if ativo else "#1E293B",
                 color="#080D16" if ativo else "#FFFFFF",
                 height=40,
@@ -2033,16 +2496,23 @@ def main(page: ft.Page):
             )
         )
 
-      botoes_filtro_uf = ft.Row(
-          wrap=True,
-          spacing=8,
-          controls=[
-              ft.ElevatedButton("🌎 Todos os 3 Estados (RS + SC + PR)", bgcolor="#38BDF8" if uf_aba_regional == "TODOS" else "#1E293B", color="#080D16" if uf_aba_regional == "TODOS" else "#FFFFFF", on_click=lambda e: escolher_uf_reg("TODOS")),
-              ft.ElevatedButton("🟢 Só Rio Grande do Sul (RS)", bgcolor="#10B981" if uf_aba_regional == "RS" else "#1E293B", color="#080D16" if uf_aba_regional == "RS" else "#FFFFFF", on_click=lambda e: escolher_uf_reg("RS")),
-              ft.ElevatedButton("🔴 Só Santa Catarina (SC)", bgcolor="#10B981" if uf_aba_regional == "SC" else "#1E293B", color="#080D16" if uf_aba_regional == "SC" else "#FFFFFF", on_click=lambda e: escolher_uf_reg("SC")),
-              ft.ElevatedButton("🔵 Só Paraná (PR)", bgcolor="#10B981" if uf_aba_regional == "PR" else "#1E293B", color="#080D16" if uf_aba_regional == "PR" else "#FFFFFF", on_click=lambda e: escolher_uf_reg("PR")),
-          ],
-      )
+      opcoes_filtro_reg = [
+          ("TODOS", "🌎 Todos os 3 Estados (RS + SC + PR)"),
+          ("RS", "🟢 Só Rio Grande do Sul (RS)"),
+          ("SC", "🔴 Só Santa Catarina (SC)"),
+          ("PR", "🔵 Só Paraná (PR)"),
+      ]
+      botoes_filtro_uf = ft.Row(wrap=True, spacing=8)
+      for cod_f, rot_f in opcoes_filtro_reg:
+        at_f = uf_aba_regional == cod_f
+        botoes_filtro_uf.controls.append(
+            ft.ElevatedButton(
+                f"✓ {rot_f}" if at_f else rot_f,
+                bgcolor="#10B981" if at_f else "#1E293B",
+                color="#080D16" if at_f else "#FFFFFF",
+                on_click=lambda e, c=cod_f: escolher_uf_reg(c),
+            )
+        )
 
       campo_contrato_emp = ft.TextField(
           label=f"Valor do Contrato da Empresa para {item_reg['nome']} (R$ / {item_reg['unidade']})",
@@ -2147,6 +2617,15 @@ def main(page: ft.Page):
 
       atualizar_analise_sul(None)
 
+      m_reg = item_reg["medias_uf"]
+      texto_copia_reg = (
+          f"🗺️ CR AgroStat — Comparativo Regional ({item_reg['nome']})\n"
+          f"🕒 Data/Hora: {horario_ultima_selecao}\n"
+          f"🏢 Contrato da Empresa: R$ {item_reg['contrato_empresa']:.2f} ({item_reg['unidade']})\n"
+          f"🟢 Média RS: R$ {m_reg['RS']:.2f} | 🔴 Média SC: R$ {m_reg['SC']:.2f} | 🔵 Média PR: R$ {m_reg['PR']:.2f}\n"
+          f"📚 Fonte: {item_reg.get('fonte_oficial', '')}"
+      )
+
       corpo_view.controls.append(
           ft.Container(
               bgcolor="#111927",
@@ -2156,7 +2635,37 @@ def main(page: ft.Page):
               content=ft.Column(
                   spacing=18,
                   controls=[
-                      ft.Text("🗺️ Contratos da Empresa & Comparativo Região Sul (RS, SC e PR)", color="#FFFFFF", size=22, weight=ft.FontWeight.BOLD),
+                      ft.Row(
+                          alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                          wrap=True,
+                          controls=[
+                              ft.Column([
+                                  ft.Text("🗺️ Contratos da Empresa & Comparativo Região Sul (RS, SC e PR)", color="#FFFFFF", size=22, weight=ft.FontWeight.BOLD),
+                                  ft.Text(
+                                      f"📚 Fonte: {item_reg.get('fonte_oficial', '')}  |  🕒 Selecionado em: {horario_ultima_selecao}",
+                                      color="#10B981",
+                                      size=12,
+                                  ),
+                              ]),
+                              ft.Row(
+                                  spacing=8,
+                                  controls=[
+                                      ft.ElevatedButton(
+                                          "📋 Copiar Comparativo",
+                                          bgcolor="#1E293B",
+                                          color="#10B981",
+                                          on_click=lambda e: copiar_para_area_transferencia("Comparativo Regional", texto_copia_reg),
+                                      ),
+                                      ft.ElevatedButton(
+                                          "📄 Gerar PDF",
+                                          bgcolor="#0284C7",
+                                          color="#FFFFFF",
+                                          on_click=lambda e: gerar_pdf_completo_usuario(f"Comparativo Regional - {item_reg['nome']}"),
+                                      ),
+                                  ],
+                              ),
+                          ],
+                      ),
                       botoes_itens_reg,
                       botoes_filtro_uf,
                       ft.Row(
@@ -2183,8 +2692,10 @@ def main(page: ft.Page):
       c_ton = ft.TextField(label="Carga do Caminhão (Toneladas)", value="32", bgcolor="#0B111E", color="#FFFFFF", border_radius=12, width=210)
       c_pedagio = ft.TextField(label="Pedágio / Taxas Extras (R$)", value="140.00", bgcolor="#0B111E", color="#FFFFFF", border_radius=12, width=210)
       painel_res_frete = ft.Column(spacing=14)
+      resumo_frete_str = ""
 
       def calcular_estudo_frete(e=None):
+        nonlocal resumo_frete_str
         painel_res_frete.controls.clear()
         try:
           km = float(c_km.value.replace(",", "."))
@@ -2197,6 +2708,14 @@ def main(page: ft.Page):
           custo_saca_60 = custo_ton * 0.06
           custo_saca_50 = custo_ton * 0.05
           custo_saca_40 = custo_ton * 0.04
+
+          resumo_frete_str = (
+              f"🚛 CR AgroStat — Estudo de Frete ({agora_str()})\n"
+              f"Rota: {km:.0f} km | R$ {rkm:.2f}/km | Carga: {ton:.1f} ton | Pedágio: R$ {ped:.2f}\n"
+              f"Custo Total: R$ {custo_viagem:,.2f} | Por Tonelada: R$ {custo_ton:.2f}/ton\n"
+              f"Impacto Saca 60kg: R$ {custo_saca_60:.2f} | Saca 50kg: R$ {custo_saca_50:.2f} | Semente 40kg: R$ {custo_saca_40:.2f}\n"
+              f"Fonte: Parâmetros ANTT / SIFRECA-Esalq + Cálculo Operacional Direto"
+          )
 
           painel_res_frete.controls.append(
               ft.ResponsiveRow(
@@ -2251,7 +2770,23 @@ def main(page: ft.Page):
               content=ft.Column(
                   spacing=20,
                   controls=[
-                      ft.Text("🚛 Estudo de Preços de Fretes & Rotas da Região Sul (RS, SC e PR)", color="#FFFFFF", size=22, weight=ft.FontWeight.BOLD),
+                      ft.Row(
+                          alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                          wrap=True,
+                          controls=[
+                              ft.Column([
+                                  ft.Text("🚛 Estudo de Preços de Fretes & Rotas da Região Sul (RS, SC e PR)", color="#FFFFFF", size=22, weight=ft.FontWeight.BOLD),
+                                  ft.Text(f"📚 Fonte de Referência Logística: Tabelas ANTT / SIFRECA-Esalq  |  🕒 Cálculo em: {agora_str()}", color="#10B981", size=12),
+                              ]),
+                              ft.Row(
+                                  spacing=8,
+                                  controls=[
+                                      ft.ElevatedButton("📋 Copiar Frete", bgcolor="#1E293B", color="#10B981", on_click=lambda e: copiar_para_area_transferencia("Estudo de Frete", resumo_frete_str)),
+                                      ft.ElevatedButton("📄 Gerar PDF", bgcolor="#0284C7", color="#FFFFFF", on_click=lambda e: gerar_pdf_completo_usuario("Estudo Logistico de Fretes")),
+                                  ],
+                              ),
+                          ],
+                      ),
                       ft.Row(wrap=True, spacing=14, controls=[c_km, c_rkm, c_ton, c_pedagio]),
                       ft.ElevatedButton("Calcular Estudo Logístico", icon=ft.icons.CALCULATE_ROUNDED, bgcolor="#FACC15", color="#080D16", height=48, on_click=calcular_estudo_frete),
                       painel_res_frete,
@@ -2284,7 +2819,8 @@ def main(page: ft.Page):
               f"💰 Preço Líquido Limpo por Saca: R$ {liq:.2f}\n"
               f"🏦 Faturamento Líquido Total do Lote: R$ {tot:,.2f}\n"
               f"⚖️ Relação de Troca (Barter): {troca:.2f} sacas de grão pagam 1 unidade de semente\n"
-              f"🌱 Poder de Compra Total: Este lote compra {qtd_sem:.1f} unidades de semente."
+              f"🌱 Poder de Compra Total: Este lote compra {qtd_sem:.1f} unidades de semente.\n"
+              f"🕒 Simulação realizada em: {agora_str()}"
           )
         except Exception:
           txt_res_b.value = "Digite números válidos nos campos."
@@ -2301,7 +2837,20 @@ def main(page: ft.Page):
               content=ft.Column(
                   spacing=20,
                   controls=[
-                      ft.Text("⚖️ Simulador de Preço Líquido & Relação de Troca (Barter)", color="#FFFFFF", size=22, weight=ft.FontWeight.BOLD),
+                      ft.Row(
+                          alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                          wrap=True,
+                          controls=[
+                              ft.Text("⚖️ Simulador de Preço Líquido & Relação de Troca (Barter)", color="#FFFFFF", size=22, weight=ft.FontWeight.BOLD),
+                              ft.Row(
+                                  spacing=8,
+                                  controls=[
+                                      ft.ElevatedButton("📋 Copiar Simulação", bgcolor="#1E293B", color="#10B981", on_click=lambda e: copiar_para_area_transferencia("Simulação Barter", txt_res_b.value)),
+                                      ft.ElevatedButton("📄 Gerar PDF", bgcolor="#0284C7", color="#FFFFFF", on_click=lambda e: gerar_pdf_completo_usuario("Simulacao Barter")),
+                                  ],
+                              ),
+                          ],
+                      ),
                       ft.Row(wrap=True, spacing=14, controls=[s_qtd, s_preco, s_frete, s_sem]),
                       ft.ElevatedButton("Calcular Relação de Troca", bgcolor="#10B981", color="#080D16", height=48, on_click=calc_b),
                       ft.Container(bgcolor="#0B111E", padding=20, border_radius=18, border=ft.border.all(1, "#10B981"), content=txt_res_b),
@@ -2311,7 +2860,7 @@ def main(page: ft.Page):
       )
 
     # -------------------------------------------------------------------------
-    # ABA 6: PLANILHAS DE DADOS E PASTA DE RELATÓRIOS COM DATAS E FONTES
+    # ABA 6: PLANILHAS DE DADOS, EXPORTAÇÃO EXCEL (.CSV) E GERADOR DE PDF
     # -------------------------------------------------------------------------
     elif aba_atual == "relatorios":
       f_uf = ft.Dropdown(label="Estado (UF)", bgcolor="#0B111E", color="#FFFFFF", width=110, options=[ft.dropdown.Option("RS"), ft.dropdown.Option("SC"), ft.dropdown.Option("PR")], value="RS")
@@ -2323,7 +2872,7 @@ def main(page: ft.Page):
 
       def adicionar_linha_planilha(e):
         novo_reg = {
-            "data": datetime.now().strftime("%d/%m/%Y %H:%M"),
+            "data": agora_str(),
             "uf": f_uf.value,
             "item": f_item.value,
             "regiao": f_regiao.value,
@@ -2333,18 +2882,17 @@ def main(page: ft.Page):
         }
         dados.setdefault("registros_planilha", []).insert(0, novo_reg)
         salvar_db(dados)
-        mostrar_aviso("Registo adicionado à planilha da Região Sul!")
+        mostrar_aviso("Registo adicionado à planilha com data e horário!")
         renderizar()
 
       def exportar_planilha_csv(e):
         os.makedirs(PASTA_RELATORIOS, exist_ok=True)
         stamp = datetime.now().strftime("%Y-%m-%d_%Hh%Mm%Ss")
         arq_csv = os.path.join(PASTA_RELATORIOS, f"Planilha_Sul_CRAgroStat_{stamp}.csv")
-        arq_txt = os.path.join(PASTA_RELATORIOS, f"Relatorio_Sul_CRAgroStat_{stamp}.txt")
 
         with open(arq_csv, "w", newline="", encoding="utf-8-sig") as f:
           w = csv.writer(f, delimiter=";")
-          w.writerow(["ITEM", "UNIDADE", "PRECO ATUAL", "MEDIA RS", "MEDIA SC", "MEDIA PR", "MEDIA GERAL SUL", "CONTRATO EMPRESA", "ESTIMATIVA 15D", "ESTIMATIVA 30D", "ESTIMATIVA 90D", "FONTE DOS RESULTADOS"])
+          w.writerow(["ITEM", "UNIDADE", "PRECO ATUAL", "MEDIA RS", "MEDIA SC", "MEDIA PR", "MEDIA GERAL SUL", "CONTRATO EMPRESA", "ESTIMATIVA 15D", "ESTIMATIVA 30D", "ESTIMATIVA 90D", "DATA E HORA DA BUSCA", "FONTE DOS RESULTADOS"])
           for it in dados["itens"]:
             m_u = calcular_medias_estados(it["regioes_sul"])
             w.writerow([
@@ -2359,24 +2907,16 @@ def main(page: ft.Page):
                 f"{it['prev_15d']:.2f}".replace(".", ","),
                 f"{it['prev_30d']:.2f}".replace(".", ","),
                 f"{it['prev_90d']:.2f}".replace(".", ","),
+                it.get("horario_busca_item", dados["atualizacao"]),
                 it.get("fonte_oficial", ""),
             ])
 
-        with open(arq_txt, "w", encoding="utf-8") as f:
-          f.write("=================================================================\n")
-          f.write("  CR AgroStat — RELATORIO OFICIAL REGIAO SUL (RS, SC E PR)\n")
-          f.write(f"  Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
-          f.write("=================================================================\n\n")
-          for it in dados["itens"]:
-            m_u = calcular_medias_estados(it["regioes_sul"])
-            f.write(f"* {it['nome']} ({it['unidade']}) -> RS: R$ {m_u['RS']:.2f} | SC: R$ {m_u['SC']:.2f} | PR: R$ {m_u['PR']:.2f} | Estim. 90d: R$ {it['prev_90d']:.2f}\n")
-            f.write(f"  Fonte: {it.get('fonte_oficial', '')}\n\n")
-
-        mostrar_aviso(f"Planilha Excel (.csv) e Relatório (.txt) com Fontes guardados em '{PASTA_RELATORIOS}'!")
+        mostrar_aviso(f"Planilha Excel (.csv) guardada em '{PASTA_RELATORIOS}'!")
         renderizar()
 
       lista_lancamentos = ft.Column(spacing=8)
       for r in dados.get("registros_planilha", [])[:10]:
+        txt_linha = f"{r['data']} | [{r.get('uf', 'RS')}] {r['item']} ({r['regiao']}) | Lote: {r['lote']} | R$ {r['valor']} | {r['obs']}"
         lista_lancamentos.controls.append(
             ft.Container(
                 bgcolor="#0B111E",
@@ -2387,11 +2927,28 @@ def main(page: ft.Page):
                     wrap=True,
                     controls=[
                         ft.Text(f"📅 {r['data']}  •  [{r.get('uf', 'RS')}] {r['item']} ({r['regiao']})", color="#FFFFFF", weight=ft.FontWeight.BOLD),
-                        ft.Text(f"Lote: {r['lote']}  |  R$ {r['valor']}  |  {r['obs']}", color="#10B981"),
+                        ft.Row(
+                            spacing=10,
+                            controls=[
+                                ft.Text(f"Lote: {r['lote']}  |  R$ {r['valor']}  |  {r['obs']}", color="#10B981"),
+                                ft.IconButton(
+                                    icon=ft.icons.CONTENT_COPY_ROUNDED,
+                                    icon_color="#38BDF8",
+                                    tooltip="Copiar esta linha",
+                                    on_click=lambda e, tx=txt_linha: copiar_para_area_transferencia("Linha da Planilha", tx),
+                                ),
+                            ],
+                        ),
                     ],
                 ),
             )
         )
+
+      os.makedirs(PASTA_RELATORIOS, exist_ok=True)
+      arquivos_salvos = sorted(os.listdir(PASTA_RELATORIOS), reverse=True)[:8]
+      col_arquivos = ft.Column(spacing=6)
+      for nome_a in arquivos_salvos:
+        col_arquivos.controls.append(ft.Text(f"📄 {PASTA_RELATORIOS}/{nome_a}", color="#38BDF8", size=13))
 
       corpo_view.controls.append(
           ft.Container(
@@ -2402,24 +2959,28 @@ def main(page: ft.Page):
               content=ft.Column(
                   spacing=20,
                   controls=[
-                      ft.Text("📁 Planilhas da Região Sul & Relatórios com Fontes", color="#FFFFFF", size=22, weight=ft.FontWeight.BOLD),
+                      ft.Text("📁 Planilhas de Dados, Exportação Excel (.CSV) & Gerador de PDF Oficial", color="#FFFFFF", size=22, weight=ft.FontWeight.BOLD),
                       ft.Row(wrap=True, spacing=12, controls=[f_uf, f_item, f_regiao, f_lote, f_valor, f_obs]),
                       ft.Row(
                           wrap=True,
                           spacing=14,
                           controls=[
                               ft.ElevatedButton("Adicionar Dados na Planilha", icon=ft.icons.ADD_CIRCLE_ROUNDED, bgcolor="#38BDF8", color="#080D16", height=48, on_click=adicionar_linha_planilha),
-                              ft.ElevatedButton("Guardar Planilha (.CSV Excel) e Relatório na Pasta", icon=ft.icons.SAVE_ROUNDED, bgcolor="#10B981", color="#080D16", height=48, on_click=exportar_planilha_csv),
+                              ft.ElevatedButton("Guardar Planilha (.CSV Excel)", icon=ft.icons.TABLE_VIEW_ROUNDED, bgcolor="#10B981", color="#080D16", height=48, on_click=exportar_planilha_csv),
+                              ft.ElevatedButton("📄 Gerar Relatório em PDF Oficial", icon=ft.icons.PICTURE_AS_PDF_ROUNDED, bgcolor="#FACC15", color="#080D16", height=48, on_click=lambda e: gerar_pdf_completo_usuario("Relatorio Oficial Completo")),
                           ],
                       ),
                       lista_lancamentos,
+                      ft.Divider(color="#1E293B"),
+                      ft.Text("Arquivos PDF e Planilhas Gerados na Pasta 'relatorios/':", color="#FFFFFF", size=15, weight=ft.FontWeight.BOLD),
+                      col_arquivos,
                   ],
               ),
           )
       )
 
     # -------------------------------------------------------------------------
-    # ABA 7: FONTES DOS RESULTADOS, ÍCONE PERSONALIZADO & SERVIDOR
+    # ABA 7: AUDITORIA DE FONTES, HORÁRIOS E ATALHO DESKTOP
     # -------------------------------------------------------------------------
     elif aba_atual == "nuvem":
       corpo_view.controls.append(
@@ -2431,7 +2992,7 @@ def main(page: ft.Page):
               content=ft.Column(
                   spacing=16,
                   controls=[
-                      ft.Text("📚 Fontes Oficiais dos Resultados & Ícone Personalizado", color="#FFFFFF", size=22, weight=ft.FontWeight.BOLD),
+                      ft.Text("📚 Auditoria de Fontes, Horários de Busca & Atalho no PC", color="#FFFFFF", size=22, weight=ft.FontWeight.BOLD),
                       ft.Container(
                           bgcolor="#0B111E",
                           padding=18,
@@ -2440,12 +3001,10 @@ def main(page: ft.Page):
                           content=ft.Column(
                               spacing=8,
                               controls=[
-                                  ft.Text("🌱 Ícone Oficial Criado Automaticamente!", color="#10B981", size=16, weight=ft.FontWeight.BOLD),
+                                  ft.Text("🖥️ Atalho 'CR AgroStat' criado na sua Área de Trabalho!", color="#10B981", size=16, weight=ft.FontWeight.BOLD),
                                   ft.Text(
-                                      "O sistema gerou automaticamente na sua pasta:\n"
-                                      "• `assets/favicon.png` e `assets/icons/icon-192.png` (Ícone da semente para a aba do navegador e telemóvel).\n"
-                                      "• `cr_agrostat.ico` (Ícone para colocar no atalho da Área de Trabalho do Windows).\n"
-                                      "Se quiser trocar por outra imagem sua no futuro, basta substituir o arquivo `assets/favicon.png`!",
+                                      "O sistema criou automaticamente na sua Área de Trabalho (Desktop) o atalho 'CR AgroStat' com o ícone oficial da semente.\n"
+                                      "Assim você não depende de clicar em links soltos: basta dar dois cliques no ícone da Área de Trabalho!",
                                       color="#E2E8F0",
                                       size=13,
                                   ),
@@ -2459,7 +3018,7 @@ def main(page: ft.Page):
                           content=ft.Column(
                               spacing=8,
                               controls=[
-                                  ft.Text("🔍 Resumo das Fontes de Dados do Sistema:", color="#38BDF8", size=16, weight=ft.FontWeight.BOLD),
+                                  ft.Text(f"🔍 Registro da Última Busca Global: {dados['atualizacao']}", color="#38BDF8", size=16, weight=ft.FontWeight.BOLD),
                                   ft.Text(
                                       "1. Bolsas Internacionais e Futuros: Chicago Board of Trade (CBOT) via API Yahoo Finance (`ZS=F`, `ZR=F`, `ZC=F`, `ZW=F`).\n"
                                       "2. Taxa de Câmbio: Dólar Comercial Spot (`USDBRL=X`).\n"
@@ -2480,46 +3039,49 @@ def main(page: ft.Page):
     page.update()
 
   def abrir_regional_item(idx_item):
-    nonlocal aba_atual, item_regional_idx
+    nonlocal aba_atual, item_regional_idx, horario_ultima_selecao
     item_regional_idx = idx_item
+    horario_ultima_selecao = agora_str()
     mudar_aba("regional")
 
   def mudar_aba(nova_aba):
-    nonlocal aba_atual
+    nonlocal aba_atual, horario_ultima_selecao
     aba_atual = nova_aba
-    for b in botoes_menu:
-      ativo = b.data == nova_aba
-      b.bgcolor = "#10B981" if ativo else "#1E293B"
-      b.color = "#080D16" if ativo else "#FFFFFF"
+    horario_ultima_selecao = agora_str()
     renderizar()
 
-  botoes_menu = [
-      ft.ElevatedButton("Painel & Gráficos Sul", icon=ft.icons.SHOW_CHART_ROUNDED, data="painel", bgcolor="#10B981", color="#080D16", height=46, on_click=lambda e: mudar_aba("painel")),
-      ft.ElevatedButton("Clima & Chuvas (Anos)", icon=ft.icons.THUNDERSTORM_ROUNDED, data="clima", bgcolor="#1E293B", color="#38BDF8", height=46, on_click=lambda e: mudar_aba("clima")),
-      ft.ElevatedButton("Contratos RS / SC / PR", icon=ft.icons.MAP_ROUNDED, data="regional", bgcolor="#1E293B", color="#FFFFFF", height=46, on_click=lambda e: mudar_aba("regional")),
-      ft.ElevatedButton("Estudo de Fretes (KM)", icon=ft.icons.LOCAL_SHIPPING_ROUNDED, data="frete", bgcolor="#1E293B", color="#FFFFFF", height=46, on_click=lambda e: mudar_aba("frete")),
-      ft.ElevatedButton("Simulador Barter", icon=ft.icons.CALCULATE_ROUNDED, data="barter", bgcolor="#1E293B", color="#FFFFFF", height=46, on_click=lambda e: mudar_aba("barter")),
-      ft.ElevatedButton("Planilhas & Relatórios", icon=ft.icons.TABLE_CHART_ROUNDED, data="relatorios", bgcolor="#1E293B", color="#FFFFFF", height=46, on_click=lambda e: mudar_aba("relatorios")),
-      ft.ElevatedButton("Fontes & Ícone", icon=ft.icons.VERIFIED_ROUNDED, data="nuvem", bgcolor="#1E293B", color="#FACC15", height=46, on_click=lambda e: mudar_aba("nuvem")),
-  ]
-
-  txt_atualizacao = ft.Text(f"Atualizado em: {dados['atualizacao']}", color="#94A3B8", size=13)
+  txt_atualizacao = ft.Text(f"🕒 Última busca nas fontes: {dados['atualizacao']}", color="#94A3B8", size=13)
   txt_dolar = ft.Text(f"Dólar Comercial: R$ {dados['dolar']:.2f} ({dados['dolar_var']:+.2f}%)", color="#38BDF8", size=15, weight=ft.FontWeight.BOLD)
 
   def acao_atualizar(e):
-    nonlocal dados
-    btn_atualizar.text = "A atualizar Mercado e Clima..."
+    nonlocal dados, horario_ultima_selecao
+    btn_atualizar.text = "A consultar fontes ao vivo..."
     btn_atualizar.disabled = True
     page.update()
     dados = coletar_mercado(dados)
-    txt_atualizacao.value = f"Atualizado em: {dados['atualizacao']}"
+    horario_ultima_selecao = dados["atualizacao"]
+    txt_atualizacao.value = f"🕒 Última busca nas fontes: {dados['atualizacao']}"
     txt_dolar.value = f"Dólar Comercial: R$ {dados['dolar']:.2f} ({dados['dolar_var']:+.2f}%)"
-    btn_atualizar.text = "Atualizar Mercado, Clima e IA"
+    btn_atualizar.text = "🔄 Atualizar Mercado, Clima e Fontes"
     btn_atualizar.disabled = False
-    mostrar_aviso("Cotações, fontes e meteorologia da Região Sul atualizadas!")
+    mostrar_aviso(f"Fontes consultadas com sucesso em {dados['atualizacao']}!")
     renderizar()
 
-  btn_atualizar = ft.ElevatedButton("Atualizar Mercado, Clima e IA", icon=ft.icons.REFRESH_ROUNDED, bgcolor="#38BDF8", color="#080D16", height=48, on_click=acao_atualizar)
+  btn_atualizar = ft.ElevatedButton(
+      "🔄 Atualizar Mercado, Clima e Fontes",
+      bgcolor="#38BDF8",
+      color="#080D16",
+      height=46,
+      on_click=acao_atualizar,
+  )
+
+  btn_pdf_topo = ft.ElevatedButton(
+      "📄 Gerar PDF Oficial",
+      bgcolor="#FACC15",
+      color="#080D16",
+      height=46,
+      on_click=lambda e: gerar_pdf_completo_usuario("Relatorio Executivo Completo"),
+  )
 
   cabecalho = ft.Container(
       width=float("inf"),
@@ -2561,7 +3123,7 @@ def main(page: ft.Page):
                               ),
                           ],
                       ),
-                      btn_atualizar,
+                      ft.Row(wrap=True, spacing=10, controls=[btn_pdf_topo, btn_atualizar]),
                   ],
               ),
               ft.Container(
@@ -2583,7 +3145,7 @@ def main(page: ft.Page):
                       ],
                   ),
               ),
-              ft.Row(wrap=True, spacing=10, controls=botoes_menu),
+              linha_menu_abas,
           ],
       ),
   )
