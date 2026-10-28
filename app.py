@@ -18,6 +18,14 @@ import subprocess
 import urllib.parse
 import xml.etree.ElementTree as ET
 import zlib
+import io
+import re
+import secrets
+import time
+import threading
+from functools import lru_cache
+from html import escape as html_escape
+from pathlib import Path
 import flet as ft
 import requests
 import yfinance as yf
@@ -26,6 +34,9 @@ ARQUIVO_DB = os.path.join("dados", "cr_agrostat_brasil_v9.json")
 ARQUIVO_USUARIOS = os.path.join("dados", "cr_usuarios_crm_v9.json")
 PASTA_RELATORIOS = "relatorios"
 PASTA_ASSETS = "assets"
+PASTA_UPLOADS = os.path.join("dados", "uploads_temporarios")
+MAPA_IBGE_CACHE = os.path.join("dados", "malha_uf_ibge_cache.geojson")
+APP_VERSAO = "10.0"
 SALT_SEGURANCA = "CRAgroStat_SaoBorja_RS_2026_Salt"
 
 # =============================================================================
@@ -89,8 +100,56 @@ def agora_str():
 
 
 def criptografar_senha(senha_limpa):
+  """Mantém verificação de senhas v9; novas senhas usam PBKDF2 e sal aleatório."""
   texto = f"{SALT_SEGURANCA}:{senha_limpa.strip()}"
   return hashlib.sha256(texto.encode("utf-8")).hexdigest()
+
+
+def criar_hash_senha_segura(senha):
+  sal = secrets.token_bytes(18)
+  derivado = hashlib.pbkdf2_hmac("sha256", senha.encode("utf-8"), sal, 310_000)
+  return "pbkdf2_sha256$310000$%s$%s" % (sal.hex(), derivado.hex())
+
+
+def verificar_senha(senha, hash_armazenado):
+  if str(hash_armazenado).startswith("pbkdf2_sha256$"):
+    try:
+      _, iteracoes, sal, valor = hash_armazenado.split("$")
+      teste = hashlib.pbkdf2_hmac("sha256", senha.encode("utf-8"), bytes.fromhex(sal), int(iteracoes))
+      return secrets.compare_digest(teste, bytes.fromhex(valor))
+    except (ValueError, TypeError):
+      return False
+  return secrets.compare_digest(criptografar_senha(senha), str(hash_armazenado))
+
+
+def salvar_json_atomico(caminho, objeto):
+  """Evita truncar o arquivo original em gravações interrompidas."""
+  pasta = os.path.dirname(caminho) or "."
+  os.makedirs(pasta, exist_ok=True)
+  temporario = f"{caminho}.{secrets.token_hex(6)}.tmp"
+  try:
+    with open(temporario, "w", encoding="utf-8") as f:
+      json.dump(objeto, f, ensure_ascii=False, indent=2)
+      f.flush()
+      os.fsync(f.fileno())
+    os.replace(temporario, caminho)
+  finally:
+    if os.path.exists(temporario):
+      os.remove(temporario)
+
+
+def dinheiro_br(valor):
+  try:
+    return "R$ " + f"{float(valor):,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+  except (TypeError, ValueError):
+    return "Indisponível"
+
+
+def numero_usuario(valor, minimo=None, maximo=None):
+  v = float(str(valor or "").strip().replace(".", "").replace(",", ".")) if "," in str(valor or "") else float(valor)
+  if not math.isfinite(v) or (minimo is not None and v < minimo) or (maximo is not None and v > maximo):
+    raise ValueError("Valor numérico fora do intervalo permitido")
+  return v
 
 
 def obter_ip_local():
@@ -163,21 +222,21 @@ def responder_ia_agronegocio(pergunta, dados, uf_sel, regiao_interna_sel, polo_c
         f"🌾 Análise de Trigo Pão ({regiao_interna_sel}): O preço dinâmico atual está em R$ {val_t:.2f} por saca de 60kg "
         f"({trigo['var_dia']:+.2f}% hoje). Na bolsa Chicago SRW Wheat Futures (CBOT: ZWW00), o contrato opera a {trigo['ult_usx']:.2f} USX "
         f"(Abertura: {trigo['abertura_usx']:.2f}, Máxima: {trigo['alta_usx']:.2f}, Mínima: {trigo['baixa_usx']:.2f}). "
-        f"Segundo a análise {fonte_ativa}, a paridade de importação e a demanda dos moinhos do Sul mantêm suporte entre R$ {trigo['prev_15d']:.2f} (15 dias) e R$ {trigo['prev_30d']:.2f} (30 dias)."
+        f"No modelo de cenários do aplicativo (fonte de referência: {fonte_ativa}), os valores ilustrativos são R$ {trigo['prev_15d']:.2f} (15 dias) e R$ {trigo['prev_30d']:.2f} (30 dias). Não são projeções oficiais."
     )
   elif "soja" in p_low:
     val_s = round(soja["preco_atual"] * fator_f, 2)
     return (
         f"🌱 Análise de Soja ({regiao_interna_sel}): A saca de 60kg está cotada hoje a R$ {val_s:.2f} ({soja['var_dia']:+.2f}%), "
         f"com Chicago (ZS=F) em {soja['ult_usx']:.2f} USX e Dólar Comercial a R$ {dolar:.2f}. "
-        f"O relatório da StoneX e CEPEA aponta atenção aos prêmios de exportação nos portos e ritmo de vendas do produtor. "
+        f"É importante acompanhar prêmios de exportação e ritmo de vendas em fontes oficiais, como StoneX e CEPEA. "
         f"A estimativa para 30 dias é de R$ {soja['prev_30d']:.2f}/sc."
     )
   elif "arroz" in p_low:
     val_a = round(arroz["preco_atual"] * fator_f, 2)
     return (
         f"🌾 Análise de Arroz em Casca ({regiao_interna_sel}): Cotação atual em R$ {val_a:.2f} por saca de 50kg ({arroz['var_dia']:+.2f}%). "
-        f"Na Fronteira Oeste (São Borja/Itaqui) e Zona Sul, o indicador IRGA/CEPEA e a StoneX destacam firmeza pela reposição das indústrias beneficiadoras. "
+        f"Para confirmar o preço da Fronteira Oeste (São Borja/Itaqui) e Zona Sul, consulte os indicadores IRGA/CEPEA e fontes comerciais. "
         f"Projeção IA para 30 dias: R$ {arroz['prev_30d']:.2f}."
     )
   elif "milho" in p_low:
@@ -188,14 +247,14 @@ def responder_ia_agronegocio(pergunta, dados, uf_sel, regiao_interna_sel, polo_c
     )
   elif any(k in p_low for k in ["clima", "chuva", "tempo", "plantio", "pulveriza"]):
     return (
-        f"🌧️ Boletim Agrometeorológico ({polo_clima_sel}): Os modelos de satélite ECMWF e NOAA GFS monitoram a umidade do solo e as frentes frias. "
+        f"🌧️ Orientação Agrometeorológica ({polo_clima_sel}): Confira os dados da aba Clima, que utiliza previsões meteorológicas quando a consulta está disponível. "
         f"Para pulverização e semeadura, aproveite as janelas sem precipitação acima de 5mm e ventos abaixo de 10 km/h. "
         f"Consulte a aba Clima para ver o comparativo completo das estações de 2023 a 2027."
     )
   elif any(k in p_low for k in ["stonex", "chicago", "bolsa", "dolar", "câmbio", "mercado"]):
     return (
         f"💎 Resumo StoneX & Chicago SRW ({agora_str()}): O Dólar Comercial opera a R$ {dolar:.2f} ({dolar_var:+.2f}%). "
-        f"{info_fonte['resumo_analise']} Hoje os destaques na sua praça ({regiao_interna_sel}) são: "
+        f"A fonte {fonte_ativa} é uma referência para consulta independente, não uma leitura automática da instituição. Os valores modelados para ({regiao_interna_sel}) são: "
         f"Soja a R$ {soja['preco_atual']:.2f}, Trigo a R$ {trigo['preco_atual']:.2f}, Arroz a R$ {arroz['preco_atual']:.2f} e Milho a R$ {milho['preco_atual']:.2f}."
     )
   elif any(k in p_low for k in ["semente", "azevem", "aveia", "hectare", "barter", "troca"]):
@@ -416,7 +475,7 @@ def gerar_svg_stories_marketing_b64(dados, uf_sel, regiao_sel, nome_consultor, t
     sinal = "+" if it["var_dia"] >= 0 else ""
     cor_v = "#4ADE80" if it["var_dia"] >= 0 else "#F87171"
     Linhas_cot += f"""
-    <rect x="32" y="{y_c}" width="476" height="68" rx="14" fill="#111927" stroke="#1E293B" stroke-width="1.5"/>
+    <rect x="32" y="{y_c}" width="476" height="68" rx="14" fill="#0E2030" stroke="#21394C" stroke-width="1.5"/>
     <circle cx="68" cy="{y_c+34}" r="18" fill="{it['cor']}" fill-opacity="0.22" stroke="{it['cor']}" stroke-width="2"/>
     <text x="68" y="{y_c+39}" fill="{it['cor']}" font-family="Arial" font-size="11" font-weight="bold" text-anchor="middle">{it['sigla'][:4]}</text>
     <text x="100" y="{y_c+29}" fill="#FFFFFF" font-family="Arial" font-size="16" font-weight="bold">{it['nome_curto']}</text>
@@ -454,18 +513,18 @@ def gerar_svg_stories_marketing_b64(dados, uf_sel, regiao_sel, nome_consultor, t
   <text x="110" y="96" fill="#38BDF8" font-family="Arial" font-size="11">📅 {dados.get('atualizacao', agora_str())} • Dólar Spot: R$ {dados.get('dolar', 5.35):.2f} ({dados.get('dolar_var', 0.0):+.2f}%)</text>
 
   <!-- Faixa da Região Selecionada -->
-  <rect x="32" y="114" width="476" height="54" rx="12" fill="#0B111E" stroke="#10B981" stroke-width="1.2"/>
+  <rect x="32" y="114" width="476" height="54" rx="12" fill="#0A1826" stroke="#10B981" stroke-width="1.2"/>
   <text x="48" y="136" fill="#FACC15" font-family="Arial" font-size="12" font-weight="bold">📍 PRAÇA / REGIÃO EM DESTAQUE:</text>
   <text x="48" y="156" fill="#FFFFFF" font-family="Arial" font-size="15" font-weight="bold">{uf_sel} • {regiao_sel[:44]}</text>
 
   <!-- Card Duplo de Clima Regional + Câmbio / Bolsas com Ilustração de Nuvem e Chuva -->
-  <rect x="32" y="180" width="232" height="118" rx="16" fill="#0B111E" stroke="#38BDF8" stroke-width="1.5"/>
+  <rect x="32" y="180" width="232" height="118" rx="16" fill="#0A1826" stroke="#38BDF8" stroke-width="1.5"/>
   <text x="48" y="204" fill="#38BDF8" font-family="Arial" font-size="12" font-weight="bold">🌧️ CLIMA &amp; CHUVA (10 DIAS)</text>
   <text x="48" y="238" fill="#FFFFFF" font-family="Arial" font-size="26" font-weight="bold">{chuva_10d_mm:.1f} mm</text>
   <text x="48" y="260" fill="#CBD5E1" font-family="Arial" font-size="12">🌡️ Temp. Hoje: {temp_hoje}</text>
   <text x="48" y="280" fill="#10B981" font-family="Arial" font-size="10" font-weight="bold">Satélite Open-Meteo ECMWF/GFS</text>
 
-  <rect x="276" y="180" width="232" height="118" rx="16" fill="#0B111E" stroke="#FACC15" stroke-width="1.5"/>
+  <rect x="276" y="180" width="232" height="118" rx="16" fill="#0A1826" stroke="#FACC15" stroke-width="1.5"/>
   <text x="292" y="204" fill="#FACC15" font-family="Arial" font-size="12" font-weight="bold">🏛️ BOLSAS &amp; CÂMBIO HOJE</text>
   <text x="292" y="238" fill="#FFFFFF" font-family="Arial" font-size="24" font-weight="bold">US$ 1 = R$ {dados.get('dolar', 5.35):.2f}</text>
   <text x="292" y="260" fill="#CBD5E1" font-family="Arial" font-size="12">Trigo CBOT: {itens[0]['ult_usx']:.1f} USX</text>
@@ -505,7 +564,7 @@ def gerar_svg_geografico_estados_brasil_b64(
           <stop offset="100%" stop-color="#071521"/>
         </linearGradient>
         <pattern id="gradeGps" width="40" height="40" patternUnits="userSpaceOnUse">
-          <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1E293B" stroke-width="0.7"/>
+          <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#21394C" stroke-width="0.7"/>
         </pattern>
       </defs>
       <rect width="580" height="260" rx="16" fill="url(#terrenoSat)" stroke="#10B981" stroke-width="1.5"/>
@@ -526,13 +585,13 @@ def gerar_svg_geografico_estados_brasil_b64(
       <!-- Pino 1: Escritório Comercial (Urbano) -->
       <circle cx="115" cy="105" r="14" fill="#38BDF8" fill-opacity="0.25"/>
       <circle cx="115" cy="105" r="6" fill="#38BDF8" stroke="#FFFFFF" stroke-width="2"/>
-      <rect x="28" y="58" width="178" height="32" rx="8" fill="#0B111E" stroke="#38BDF8" stroke-width="1.2"/>
+      <rect x="28" y="58" width="178" height="32" rx="8" fill="#0A1826" stroke="#38BDF8" stroke-width="1.2"/>
       <text x="40" y="78" fill="#38BDF8" font-family="Arial" font-size="11" font-weight="bold">🏢 Escritório / Sede Urbana</text>
 
       <!-- Pino 2: Lavoura / Sede da Fazenda no Interior -->
       <circle cx="430" cy="138" r="18" fill="#FACC15" fill-opacity="0.28"/>
       <circle cx="430" cy="138" r="7" fill="#FACC15" stroke="#080D16" stroke-width="2"/>
-      <rect x="285" y="192" width="275" height="52" rx="10" fill="#0B111E" stroke="#FACC15" stroke-width="1.4"/>
+      <rect x="285" y="192" width="275" height="52" rx="10" fill="#0A1826" stroke="#FACC15" stroke-width="1.4"/>
       <text x="298" y="212" fill="#FACC15" font-family="Arial" font-size="12" font-weight="bold">🚜 Lavoura: {nome_cli[:26]}</text>
       <text x="298" y="230" fill="#E2E8F0" font-family="Arial" font-size="10">📍 {roteiro_cli[:36]} (GPS: {lat_cli:.3f}, {lon_cli:.3f})</text>
 
@@ -551,7 +610,7 @@ def gerar_svg_geografico_estados_brasil_b64(
       <stop offset="100%" stop-color="#060B14"/>
     </radialGradient>
     <pattern id="gradeCartografica" width="65" height="58" patternUnits="userSpaceOnUse">
-      <path d="M 65 0 L 0 0 0 58" fill="none" stroke="#1E293B" stroke-width="0.8" stroke-dasharray="3,3"/>
+      <path d="M 65 0 L 0 0 0 58" fill="none" stroke="#21394C" stroke-width="0.8" stroke-dasharray="3,3"/>
     </pattern>
     <filter id="relevoTerreno" x="-5%" y="-5%" width="110%" height="110%">
       <feDropShadow dx="0" dy="5" stdDeviation="6" flood-color="#000000" flood-opacity="0.7"/>
@@ -569,7 +628,7 @@ def gerar_svg_geografico_estados_brasil_b64(
 
   <!-- Países Limítrofes da América do Sul (Argentina, Uruguai, Paraguai, Bolívia) -->
   <path d="M 125,240 L 182,292 L 235,315 L 252,380 L 265,435 L 245,495 L 295,548 L 328,538 L 285,578 L 95,578 L 82,310 Z"
-        fill="#0B1320" stroke="#1E293B" stroke-width="1.4"/>
+        fill="#0B1320" stroke="#21394C" stroke-width="1.4"/>
   <text x="195" y="495" fill="#334155" font-family="Arial" font-size="10" font-weight="bold">ARGENTINA</text>
   <text x="295" y="572" fill="#334155" font-family="Arial" font-size="9" font-weight="bold">URUGUAI</text>
   <text x="215" y="395" fill="#334155" font-family="Arial" font-size="9" font-weight="bold">PARAGUAI</text>
@@ -619,12 +678,222 @@ def gerar_svg_geografico_estados_brasil_b64(
     <text x="355" y="472">SC</text><text x="318" y="516" fill="#FFFFFF" font-size="12">RS</text>
   </g>
 
-  <rect x="445" y="495" width="188" height="68" rx="12" fill="#0B111E" stroke="#10B981" stroke-width="1.5"/>
+  <rect x="445" y="495" width="188" height="68" rx="12" fill="#0A1826" stroke="#10B981" stroke-width="1.5"/>
   <text x="458" y="516" fill="#10B981" font-family="Arial" font-size="11" font-weight="bold">ESTADO EM DESTAQUE: {uf_ativa}</text>
   <text x="458" y="534" fill="#E2E8F0" font-family="Arial" font-size="10">Clique nos pinos ou selecione</text>
   <text x="458" y="549" fill="#38BDF8" font-family="Arial" font-size="10">a Região Interna do Estado</text>
 </svg>"""
   return base64.b64encode(svg.encode("utf-8")).decode("utf-8")
+
+
+# =============================================================================
+# CARTOGRAFIA DAS UFs: GeoJSON original derivado das malhas do IBGE
+# Fonte pública CC0: github.com/henriquemalvar/br-geojson (estados.geojson)
+# Um único app.py; o arquivo cartográfico é baixado e colocado no cache na 1ª carga.
+# =============================================================================
+MAPA_GEODADOS_URLS = (
+    "https://raw.githubusercontent.com/henriquemalvar/br-geojson/main/dist/estados.geojson",
+    "https://cdn.jsdelivr.net/gh/henriquemalvar/br-geojson@main/dist/estados.geojson",
+)
+
+
+def coordenada_mapa(lat, lon):
+  """Projeção geográfica com mesma escala de longitude e latitude (sem distorcer as UFs)."""
+  return 28 + (float(lon) + 74.25) * 16.4, 23 + (5.4 - float(lat)) * 16.4
+
+
+def _distancia_segmento(p, a, b):
+  dx, dy = b[0] - a[0], b[1] - a[1]
+  if dx == dy == 0:
+    return math.hypot(p[0] - a[0], p[1] - a[1])
+  t = max(0.0, min(1.0, ((p[0]-a[0])*dx + (p[1]-a[1])*dy) / (dx*dx+dy*dy)))
+  return math.hypot(p[0]-(a[0]+t*dx), p[1]-(a[1]+t*dy))
+
+
+def simplificar_linha(pontos, tolerancia=0.85):
+  """Reduz pontos sem deslocar significativamente os limites dos estados."""
+  if len(pontos) < 4:
+    return pontos
+  maior, indice = 0, 0
+  for i in range(1, len(pontos)-1):
+    dist = _distancia_segmento(pontos[i], pontos[0], pontos[-1])
+    if dist > maior:
+      maior, indice = dist, i
+  if maior > tolerancia:
+    return simplificar_linha(pontos[:indice+1], tolerancia)[:-1] + simplificar_linha(pontos[indice:], tolerancia)
+  return [pontos[0], pontos[-1]]
+
+
+@lru_cache(maxsize=1)
+def carregar_estados_geojson():
+  try:
+    if os.path.isfile(MAPA_IBGE_CACHE):
+      with open(MAPA_IBGE_CACHE, "r", encoding="utf-8") as f:
+        cache = json.load(f)
+      if cache.get("type") == "FeatureCollection" and len(cache.get("features", [])) >= 26:
+        return cache
+  except (OSError, ValueError, TypeError):
+    pass
+  for url in MAPA_GEODADOS_URLS:
+    try:
+      resp = requests.get(url, timeout=9, headers={"User-Agent": "CRAgroStat/10.0 (IBGE GeoJSON map)"})
+      resp.raise_for_status()
+      if len(resp.content) > 32_000_000:
+        continue
+      cache = resp.json()
+      if cache.get("type") == "FeatureCollection" and len(cache.get("features", [])) >= 26:
+        salvar_json_atomico(MAPA_IBGE_CACHE, cache)
+        return cache
+    except (requests.RequestException, ValueError, OSError):
+      continue
+  return None
+
+
+_CENTROS_UF = {
+ "AC":(-9.0,-70.6), "AL":(-9.7,-36.6), "AP":(1.3,-51.7), "AM":(-3.8,-63.2),
+ "BA":(-12.5,-41.7), "CE":(-5.3,-39.3), "DF":(-15.8,-47.9), "ES":(-19.6,-40.6),
+ "GO":(-16.3,-49.2), "MA":(-5.0,-45.3), "MT":(-12.9,-55.9), "MS":(-20.6,-54.5),
+ "MG":(-18.6,-44.3), "PA":(-4.6,-52.3), "PB":(-7.1,-36.8), "PR":(-24.7,-51.3),
+ "PE":(-8.3,-37.9), "PI":(-7.7,-42.6), "RJ":(-22.2,-42.8), "RN":(-5.8,-36.7),
+ "RS":(-30.0,-53.2), "RO":(-10.9,-63.1), "RR":(2.0,-61.1), "SC":(-27.4,-50.9),
+ "SP":(-22.6,-48.7), "SE":(-10.6,-37.4), "TO":(-10.2,-48.0)
+}
+
+
+def mapa_brasil_ibge_b64(uf_ativa="RS"):
+  """Desenha todas as 27 UFs utilizando as coordenadas reais de seus polígonos."""
+  geo = carregar_estados_geojson()
+  if not geo:
+    return None
+  regioes = {uf: nome for nome, ufs in HIERARQUIA_BRASIL.items() for uf in ufs}
+  cor_regiao = {"Sul":"#0D816D", "Centro-Oeste":"#9F751F", "Sudeste":"#28608C",
+                "Nordeste (MATOPIBA)":"#96663B", "Norte":"#286D62"}
+  partes = []
+  for ft_geo in geo["features"]:
+    prop = ft_geo.get("properties", {})
+    sigla = str(prop.get("sigla") or prop.get("uf") or "").upper()
+    if len(sigla) != 2:
+      continue
+    geom = ft_geo.get("geometry", {})
+    tipo = geom.get("type")
+    coords = geom.get("coordinates", [])
+    grupos = [coords] if tipo == "Polygon" else coords if tipo == "MultiPolygon" else []
+    caminhos = []
+    for poly in grupos:
+      for anel in poly:
+        if len(anel) < 3:
+          continue
+        pontos = [coordenada_mapa(lat, lon) for lon, lat in anel]
+        if pontos[0] != pontos[-1]:
+          pontos.append(pontos[0])
+        for_x = simplificar_linha(pontos, 0.52)
+        caminhos.append("M" + " L".join(f"{x:.1f},{y:.1f}" for x,y in for_x) + " Z")
+    ativo = sigla == uf_ativa
+    cor = "#20C997" if ativo else cor_regiao.get(regioes.get(sigla), "#334E65")
+    if caminhos:
+      partes.append(f'<path d="{" ".join(caminhos)}" fill="{cor}" stroke="{"#D9F99D" if ativo else "#9AB5BF"}" stroke-width="{"2.1" if ativo else "0.75"}" stroke-linejoin="round" fill-rule="evenodd"/>')
+  rotulos=[]
+  for sigla,(lat,lon) in _CENTROS_UF.items():
+    x,y=coordenada_mapa(lat,lon)
+    rotulos.append(f'<text x="{x:.1f}" y="{y:.1f}" text-anchor="middle" fill="{"#07111C" if sigla==uf_ativa else "#EAF4F3"}" font-size="10" font-weight="bold" font-family="Arial,sans-serif">{sigla}</text>')
+  svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="720" height="700" viewBox="0 0 720 700">
+  <defs><linearGradient id="sea" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#102940"/><stop offset="1" stop-color="#06101C"/></linearGradient></defs>
+  <rect width="720" height="700" rx="18" fill="url(#sea)"/>
+  <g stroke="#294258" stroke-opacity=".45">{''.join(f'<line x1="{x}" x2="{x}" y1="12" y2="688" stroke-dasharray="3 6"/>' for x in range(70,720,90))}{''.join(f'<line y1="{y}" y2="{y}" x1="12" x2="708" stroke-dasharray="3 6"/>' for y in range(70,700,90))}</g>
+  <g>{''.join(partes)}</g><g>{''.join(rotulos)}</g>
+  <rect x="20" y="650" width="245" height="35" rx="9" fill="#07151F" stroke="#1CB08C"/>
+  <text x="31" y="673" font-family="Arial,sans-serif" fill="#C9F7E9" font-size="12">Malha cartográfica IBGE • UF: {html_escape(str(uf_ativa))}</text>
+  </svg>"""
+  return base64.b64encode(svg.encode("utf-8")).decode("ascii")
+
+
+def url_mapa_osm_cliente(lat,lon):
+  """Mapa de ruas por coordenadas, não simulação de satélite/talhão."""
+  # OpenStreetMap StaticMap (serviço externo gratuito sujeito a disponibilidade).
+  params = {"center": f"{float(lat):.5f},{float(lon):.5f}",
+            "zoom": 12, "size": "600x260", "maptype": "mapnik",
+            "markers": f"{float(lat):.5f},{float(lon):.5f},red-pushpin"}
+  return "https://staticmap.openstreetmap.de/staticmap.php?" + urllib.parse.urlencode(params)
+
+
+def sintetizar_tts_ptbr(texto, voz="Feminina"):
+  """Converte texto em MP3 por serviço web. Retorna None se o serviço não responder.
+  Para timbre masculino natural: instalar opcionalmente edge-tts no ambiente.
+  """
+  texto = re.sub(r"[^\w\s.,;:!?()áàâãéêíóôõúçÁÀÂÃÉÊÍÓÔÕÚÇ/+-]", " ", texto)
+  texto = " ".join(texto.split())[:600]
+  if not texto:
+    return None
+  try:
+    import edge_tts
+    import asyncio
+    async def montar_audio():
+      nome = "pt-BR-AntonioNeural" if "Masc" in voz else "pt-BR-FranciscaNeural"
+      dados_mp3 = bytearray()
+      comunicador = edge_tts.Communicate(texto, nome, rate="+0%")
+      async for pedaco in comunicador.stream():
+        if pedaco.get("type") == "audio":
+          dados_mp3.extend(pedaco["data"])
+      return bytes(dados_mp3)
+    # edge-tts é opcional: funciona melhor quando instalado em requirements.txt.
+    try:
+      return asyncio.run(montar_audio())
+    except RuntimeError:
+      # Alguns executores Flet já executam dentro de um event loop.
+      pass
+  except (ImportError, Exception):
+    pass
+  # Alternativa sem dependência adicional: Google Translate TTS (voz padrão).
+  # Não promete distinção masculino/feminino nesta alternativa.
+  try:
+    audio = bytearray()
+    palavras = texto.split()
+    blocos, bloco = [], ""
+    for palavra in palavras:
+      if len(bloco) + len(palavra) + 1 > 150 and bloco:
+        blocos.append(bloco)
+        bloco = palavra
+      else:
+        bloco = (bloco + " " + palavra).strip()
+    if bloco:
+      blocos.append(bloco)
+    for trecho in blocos[:4]:
+      r = requests.get("https://translate.google.com/translate_tts", params={
+          "ie":"UTF-8", "client":"tw-ob", "tl":"pt-BR", "q":trecho},
+          headers={"User-Agent":"Mozilla/5.0"}, timeout=6)
+      if not r.ok or "audio" not in r.headers.get("Content-Type", ""):
+        return None
+      audio.extend(r.content)
+    return bytes(audio) if audio else None
+  except requests.RequestException:
+    return None
+
+
+def resposta_ia_com_api_opcional(pergunta, dados, uf, subregiao, resposta_local):
+  """API é opcional. Não envia base de clientes nem dados pessoais do CRM."""
+  chave = os.getenv("OPENAI_API_KEY", "").strip()
+  if not chave:
+    return resposta_local
+  itens_resumidos = [{"produto":i.get("nome_curto"), "preco_estimado":i.get("preco_atual"),
+                     "unidade":i.get("unidade"), "variacao_estimada":i.get("var_dia")}
+                    for i in dados.get("itens", [])]
+  contexto = {"estado": uf, "regiao":subregiao, "data_atualizacao":dados.get("atualizacao"),
+              "estimativas_regionais":itens_resumidos, "dolar":dados.get("dolar"),
+              "observacao":"Os preços regionais não são cotações oficiais e as projeções são cenários ilustrativos."}
+  try:
+    r = requests.post("https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": "Bearer " + chave},
+        json={"model":os.getenv("OPENAI_MODEL", "gpt-4o-mini"), "temperature":0.3,
+              "max_tokens":360,
+              "messages":[{"role":"system", "content": "Você é assistente agrícola no Brasil. Seja preciso. Nunca transforme preços simulados em cotações oficiais ou dados ao vivo. Não atribua a entidades externas análises não consultadas. Responda em português claro; se faltarem dados diga explicitamente."},
+                          {"role":"user", "content": "Dados do sistema: "+json.dumps(contexto,ensure_ascii=False)+"\nPergunta: "+pergunta}]}, timeout=14)
+    if r.ok:
+      txt = r.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+      if txt:
+        return txt.strip()
+  except (requests.RequestException, ValueError, TypeError, IndexError):
+    pass
+  return resposta_local + "\n\n(A IA online não respondeu; resultado obtido pelo analisador local.)"
 
 
 # =============================================================================
@@ -923,8 +1192,7 @@ def inicializar_banco_usuarios():
 
 def salvar_banco_usuarios(db_u):
   os.makedirs("dados", exist_ok=True)
-  with open(ARQUIVO_USUARIOS, "w", encoding="utf-8") as f:
-    json.dump(db_u, f, ensure_ascii=False, indent=2)
+  salvar_json_atomico(ARQUIVO_USUARIOS, db_u)
 
 
 # =============================================================================
@@ -1738,6 +2006,9 @@ def coletar_mercado(dados_existentes=None):
 
   pacote = {
       "atualizacao": horario_coleta,
+      "tipo_precificacao": "Estimativa regional calculada a partir de bases e índices; NÃO equivale a cotação oficial de balcão.",
+      "fontes_consultadas": {"cambio_yahoo": bool(dolar != 5.34), "tickers_yahoo": [k for k, v in bolsa.items() if v.get("pares")]},
+      "modelo_previsao": "Cenários ilustrativos (+15/+30/+60/+90 dias), não previsões estatísticas validadas.",
       "dolar": round(dolar, 2),
       "dolar_var": round(dolar_var, 2),
       "itens": itens,
@@ -1749,8 +2020,7 @@ def coletar_mercado(dados_existentes=None):
 
 def salvar_db(pacote):
   os.makedirs("dados", exist_ok=True)
-  with open(ARQUIVO_DB, "w", encoding="utf-8") as f:
-    json.dump(pacote, f, ensure_ascii=False, indent=2)
+  salvar_json_atomico(ARQUIVO_DB, pacote)
 
 
 def carregar_db():
@@ -1770,9 +2040,10 @@ def carregar_db():
 # =============================================================================
 
 def main(page: ft.Page):
-  page.title = "CR AgroStat Brasil v9.0 — Chicago SRW, StoneX, Clima, IA & CRM"
-  page.bgcolor = "#080D16"
-  page.padding = 12
+  page.title = "CR AgroStat Brasil v10 • Inteligência Agrícola"
+  page.bgcolor = "#07111C"
+  page.padding = 10
+  page.theme = ft.Theme(color_scheme_seed="#10B981", font_family="Roboto")
   page.scroll = None
 
   ip_local = obter_ip_local()
@@ -1781,6 +2052,8 @@ def main(page: ft.Page):
 
   usuario_logado_key = None
   tentativas_falhas = 0
+  ultimo_bloqueio_login = 0.0
+  menu_mobile_ativo = False
 
   # Estado de Navegação e Hierarquia de 3 Níveis (Macro-Região -> Estado UF -> Sub-Região)
   aba_atual = "painel"
@@ -1810,9 +2083,8 @@ def main(page: ft.Page):
           "hora": agora_str(),
           "texto": (
               "Olá! Sou a Inteligência Artificial do CR AgroStat Brasil. "
-              "Posso responder por texto e voz (Masculina ou Feminina) sobre as cotações dinâmicas "
-              "do Trigo (calibrado na faixa de R$ 73,00/sc no RS com oscilação ao vivo), Soja, Arroz, Milho, "
-              "relatórios da StoneX, Chicago SRW Wheat Futures, clima da sua região e cálculos de frete ou Barter!"
+              "Posso ajudar a interpretar preços regionais estimados, indicadores de bolsa, clima, fretes e barter. "
+              "O sistema distingue dados consultados de simulações. Use Ouvir para reproduzir a resposta no navegador."
           ),
       }
   ]
@@ -1831,6 +2103,48 @@ def main(page: ft.Page):
   raiz_pagina = ft.Container(expand=True)
   coluna_lateral_menu = ft.Column(spacing=7, scroll=ft.ScrollMode.AUTO, expand=True)
   area_conteudo_direita = ft.Column(spacing=14, scroll=ft.ScrollMode.AUTO, expand=True)
+  # Um áudio WAV silencioso curto satisfaz a validação da API Flet 0.24.1.
+  import wave
+  buffer_silencio = io.BytesIO()
+  with wave.open(buffer_silencio, "wb") as wav:
+    wav.setnchannels(1)
+    wav.setsampwidth(2)
+    wav.setframerate(8000)
+    wav.writeframes(b"\x00\x00" * 800)
+  audio_da_ia = ft.Audio(src_base64=base64.b64encode(buffer_silencio.getvalue()).decode("ascii"), autoplay=False, volume=1.0)
+  page.overlay.append(audio_da_ia)
+  audio_geracao = 0
+
+  def falar_navegador(texto, voz=None):
+    """TTS reproduzido no dispositivo do usuário, inclusive via navegador."""
+    nonlocal audio_geracao
+    audio_geracao += 1
+    versao = audio_geracao
+    voz_ativa = voz or voz_selecionada
+
+    def carregar_audio():
+      mp3 = sintetizar_tts_ptbr(texto, voz_ativa)
+      if versao != audio_geracao:
+        return
+      if not mp3:
+        mostrar_aviso("Áudio indisponível. Confira internet ou configure edge-tts para vozes naturais.", "#EAB308")
+        return
+      try:
+        audio_da_ia.src_base64 = base64.b64encode(mp3).decode("ascii")
+        audio_da_ia.update()
+        audio_da_ia.play()
+      except Exception:
+        mostrar_aviso("O navegador bloqueou o áudio. Clique novamente em Ouvir.", "#EAB308")
+    # Evita travar a interface durante o carregamento.
+    page.run_thread(carregar_audio)
+
+  def parar_audio(e=None):
+    nonlocal audio_geracao
+    audio_geracao += 1
+    try:
+      audio_da_ia.pause()
+    except Exception:
+      pass
 
   def mostrar_aviso(texto, cor="#10B981"):
     page.snack_bar = ft.SnackBar(
@@ -1844,24 +2158,80 @@ def main(page: ft.Page):
     page.set_clipboard(texto_copiar)
     mostrar_aviso(f"📋 '{titulo_copia}' copiado para a área de transferência!")
 
-  # Uploader de Foto de Perfil (Quadrado com Cantos Arredondados Grande)
+  # Upload de imagem compatível com desktop e navegador Flet/Render.
+  # Não depende de caminho local do usuário no servidor.
+  upload_pendente = {}
+
+  def finalizar_foto(bytes_foto):
+    if not usuario_logado_key:
+      return
+    if len(bytes_foto) > 4 * 1024 * 1024:
+      mostrar_aviso("Imagem muito grande. Escolha uma foto de até 4 MB.", "#F97316")
+      return
+    # JPG, PNG, WEBP ou GIF; impede arquivos arbitrários disfarçados de imagem.
+    assinaturas = (b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF87a", b"GIF89a", b"RIFF")
+    if not bytes_foto.startswith(assinaturas) or (bytes_foto.startswith(b"RIFF") and bytes_foto[8:12] != b"WEBP"):
+      mostrar_aviso("Selecione uma imagem JPG, PNG, WEBP ou GIF válida.", "#EF4444")
+      return
+    db_usuarios["usuarios"][usuario_logado_key]["foto_b64"] = base64.b64encode(bytes_foto).decode("ascii")
+    salvar_banco_usuarios(db_usuarios)
+    mostrar_aviso("Foto do perfil atualizada e salva!")
+    montar_sistema()
+
   def ao_escolher_foto_perfil(e: ft.FilePickerResultEvent):
     if not e.files or not usuario_logado_key:
       return
     arq = e.files[0]
-    if arq.path and os.path.exists(arq.path):
+    if arq.size and arq.size > 4 * 1024 * 1024:
+      mostrar_aviso("Foto maior que 4 MB. Escolha outra imagem.", "#F97316")
+      return
+    if not str(arq.name).lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+      mostrar_aviso("A foto deve ser PNG, JPG, WEBP ou GIF.", "#F97316")
+      return
+    if arq.path and os.path.isfile(arq.path):
       try:
         with open(arq.path, "rb") as f:
-          b_img = f.read()
-        db_usuarios["usuarios"][usuario_logado_key]["foto_b64"] = base64.b64encode(b_img).decode("utf-8")
-        salvar_banco_usuarios(db_usuarios)
-        mostrar_aviso("📸 Foto de perfil ampliada atualizada com sucesso!")
-        montar_sistema()
-      except Exception:
-        mostrar_aviso("Não foi possível carregar a imagem selecionada.", "#EF4444")
+          finalizar_foto(f.read())
+      except OSError:
+        mostrar_aviso("Não foi possível abrir a foto.", "#EF4444")
+      return
+    # Em navegadores, FilePickerFile.path é None. Faça upload assinado ao servidor.
+    os.makedirs(PASTA_UPLOADS, exist_ok=True)
+    destino = secrets.token_hex(18) + Path(arq.name).suffix.lower()
+    upload_pendente.clear()
+    upload_pendente.update({"original": arq.name, "destino": os.path.join(PASTA_UPLOADS, destino)})
+    try:
+      url = page.get_upload_url(destino, 600)
+      seletor_foto.upload([ft.FilePickerUploadFile(arq.name, upload_url=url)])
+      mostrar_aviso("Enviando foto de perfil...")
+    except Exception:
+      mostrar_aviso("Falha no upload. Confira permissão de gravação no servidor.", "#EF4444")
 
-  seletor_foto = ft.FilePicker(on_result=ao_escolher_foto_perfil)
+  def ao_subir_foto_perfil(e: ft.FilePickerUploadEvent):
+    if e.error:
+      mostrar_aviso("Não foi possível enviar a foto: " + str(e.error)[:90], "#EF4444")
+      return
+    if e.progress < 1 or not upload_pendente:
+      return
+    caminho = upload_pendente.get("destino")
+    upload_pendente.clear()
+    try:
+      with open(caminho, "rb") as f:
+        conteudo = f.read(4 * 1024 * 1024 + 1)
+      finalizar_foto(conteudo)
+    except OSError:
+      mostrar_aviso("Upload finalizado, mas o arquivo não foi encontrado.", "#EF4444")
+    finally:
+      try:
+        os.remove(caminho)
+      except (OSError, TypeError):
+        pass
+
+  seletor_foto = ft.FilePicker(on_result=ao_escolher_foto_perfil, on_upload=ao_subir_foto_perfil)
   page.overlay.append(seletor_foto)
+
+  def escolher_foto(e):
+    seletor_foto.pick_files(allow_multiple=False, file_type=ft.FilePickerFileType.IMAGE)
 
   def obter_avatar_quadrado_grande(u_dict, largura=108, altura=108, raio=24):
     """Cria o avatar em formato quadrado com cantos arredondados bem maior e destacado."""
@@ -1956,8 +2326,17 @@ def main(page: ft.Page):
   def gerar_pdf_completo_usuario(contexto_relatorio="Relatorio Oficial"):
     os.makedirs(PASTA_RELATORIOS, exist_ok=True)
     stamp = datetime.now().strftime("%Y-%m-%d_%Hh%Mm%Ss")
-    nome_pdf = f"Relatorio_CRAgroStat_{stamp}.pdf"
-    caminho_pdf = os.path.join(PASTA_RELATORIOS, nome_pdf)
+    nome_pdf = f"CRAgroStat_{stamp}_{secrets.token_urlsafe(16)}.pdf"
+    pasta_publica = os.path.join(PASTA_ASSETS, "relatorios_temp")
+    os.makedirs(pasta_publica, exist_ok=True)
+    # Limpa relatórios temporários antigos (24h) sem tocar nos dados do CRM.
+    for arquivo_antigo in Path(pasta_publica).glob("CRAgroStat_*.pdf"):
+      try:
+        if time.time() - arquivo_antigo.stat().st_mtime > 86400:
+          arquivo_antigo.unlink()
+      except OSError:
+        pass
+    caminho_pdf = os.path.join(pasta_publica, nome_pdf)
     u_info = db_usuarios["usuarios"].get(usuario_logado_key, {}) if usuario_logado_key else {}
 
     linhas = [
@@ -1967,7 +2346,11 @@ def main(page: ft.Page):
         f"Fonte de Analise Ativa: {fonte_analise_ativa} | Data/Hora: {agora_str()}",
         f"Cambio Dolar Comercial Spot: R$ {dados['dolar']:.2f} ({dados['dolar_var']:+.2f}%)",
         "",
-        "=== COTACOES DINAMICAS (CHICAGO SRW WHEAT FUTURES, STONEX E PRACAS FISICAS) ===",
+        "ATENCAO: precos de pracas e diferencas por fonte sao calculados pelo aplicativo, nao cotacoes oficiais.",
+        "Projecoes de 15 a 90 dias sao cenarios de referencia, nao previsoes estatisticas validadas.",
+        "Consulte fonte e data da cotacao antes de realizar qualquer negociacao.",
+        "",
+        "=== INDICADORES DE MERCADO E ESTIMATIVAS REGIONAIS ===",
     ]
     for it in dados["itens"]:
       val_reg = calcular_preco_dinamico_atual(it, uf_selecionada, subregiao_selecionada, fonte_analise_ativa)
@@ -1994,7 +2377,11 @@ def main(page: ft.Page):
         os.startfile(os.path.abspath(caminho_pdf))
       except Exception:
         pass
-    mostrar_aviso(f"📄 PDF Oficial gerado e aberto em '{PASTA_RELATORIOS}/{nome_pdf}'!")
+    mostrar_aviso("Relatório PDF gerado. Abrindo o arquivo no navegador...")
+    try:
+      page.launch_url("/relatorios_temp/" + urllib.parse.quote(nome_pdf))
+    except Exception:
+      mostrar_aviso(f"PDF salvo localmente: {caminho_pdf}")
 
   # =========================================================================
   # COMPONENTE: SELETOR HIERÁRQUICO DE 3 NÍVEIS (MACRO-REGIÃO ➔ ESTADO ➔ REGIÃO INTERNA)
@@ -2031,7 +2418,7 @@ def main(page: ft.Page):
       row_macros.controls.append(
           ft.ElevatedButton(
               f"✓ {m_nome}" if at_m else m_nome,
-              bgcolor="#10B981" if at_m else "#1E293B",
+              bgcolor="#10B981" if at_m else "#21394C",
               color="#080D16" if at_m else "#FFFFFF",
               height=32,
               on_click=lambda e, m=m_nome: escolher_macro(m),
@@ -2048,7 +2435,7 @@ def main(page: ft.Page):
       row_estados.controls.append(
           ft.ElevatedButton(
               f"✓ 📍 {nome_ext}" if at_u else f"📍 {nome_ext}",
-              bgcolor="#38BDF8" if at_u else "#1E293B",
+              bgcolor="#38BDF8" if at_u else "#21394C",
               color="#080D16" if at_u else "#E2E8F0",
               height=32,
               on_click=lambda e, u=sigla_u: escolher_estado(u),
@@ -2067,7 +2454,7 @@ def main(page: ft.Page):
       row_subregioes.controls.append(
           ft.ElevatedButton(
               f"✓ 🌾 {s_nome}" if at_s else f"🌾 {s_nome}",
-              bgcolor="#FACC15" if at_s else "#0B111E",
+              bgcolor="#FACC15" if at_s else "#0A1826",
               color="#080D16" if at_s else "#CBD5E1",
               height=32,
               on_click=lambda e, s=s_nome: escolher_subregiao(s),
@@ -2075,10 +2462,10 @@ def main(page: ft.Page):
       )
 
     return ft.Container(
-        bgcolor="#0B111E",
+        bgcolor="#0A1826",
         padding=14,
         border_radius=16,
-        border=ft.border.all(1, "#1E293B"),
+        border=ft.border.all(1, "#21394C"),
         content=ft.Column(spacing=8, controls=[row_macros, row_estados, row_subregioes]),
     )
 
@@ -2086,20 +2473,30 @@ def main(page: ft.Page):
   # TELA DE LOGIN
   # =========================================================================
   def construir_tela_autenticacao():
-    nonlocal tentativas_falhas, usuario_logado_key, uf_selecionada, subregiao_selecionada, polo_clima_sel, fonte_analise_ativa, voz_selecionada
+    nonlocal tentativas_falhas, usuario_logado_key, uf_selecionada, subregiao_selecionada, polo_clima_sel, fonte_analise_ativa, voz_selecionada, ultimo_bloqueio_login
 
-    inp_user = ft.TextField(label="👤 Utilizador (marcio ou carlise)", value="marcio", bgcolor="#0B111E", color="#FFFFFF", border_radius=14, border_color="#10B981", width=360)
-    inp_pass = ft.TextField(label="🔒 Palavra-passe", value="Agro@2026", password=True, can_reveal_password=True, bgcolor="#0B111E", color="#FFFFFF", border_radius=14, width=360)
+    largura_login = min(540, max(265, (page.width or 850) - 30))
+    largura_campo_login = min(360, largura_login - (48 if (page.width or 850) < 600 else 74))
+    inp_user = ft.TextField(label="👤 Usuário", value="", bgcolor="#0A1826", color="#FFFFFF", border_radius=14, border_color="#10B981", width=largura_campo_login)
+    inp_pass = ft.TextField(label="🔒 Senha", value="", password=True, can_reveal_password=True, bgcolor="#0A1826", color="#FFFFFF", border_radius=14, width=largura_campo_login)
     txt_erro_login = ft.Text("", color="#EF4444", size=13, weight=ft.FontWeight.BOLD)
 
     def fazer_login(e):
-      nonlocal tentativas_falhas, usuario_logado_key, uf_selecionada, subregiao_selecionada, polo_clima_sel, fonte_analise_ativa, voz_selecionada
+      nonlocal tentativas_falhas, usuario_logado_key, uf_selecionada, subregiao_selecionada, polo_clima_sel, fonte_analise_ativa, voz_selecionada, ultimo_bloqueio_login
+      if tentativas_falhas >= 5 and time.monotonic() - ultimo_bloqueio_login < 90:
+        txt_erro_login.value = "Muitas tentativas. Aguarde 90 segundos e tente novamente."
+        page.update()
+        return
       u_dig = inp_user.value.strip().lower()
       s_dig = inp_pass.value.strip()
       usuarios_cad = db_usuarios.get("usuarios", {})
-      if u_dig in usuarios_cad and usuarios_cad[u_dig]["senha_hash"] == criptografar_senha(s_dig):
+      if u_dig in usuarios_cad and verificar_senha(s_dig, usuarios_cad[u_dig].get("senha_hash", "")):
         u_obj = usuarios_cad[u_dig]
         usuario_logado_key = u_dig
+        tentativas_falhas = 0
+        ultimo_bloqueio_login = 0.0
+        if usuarios_cad[u_dig].get("senha_hash") == criptografar_senha("Agro@2026"):
+          mostrar_aviso("IMPORTANTE: senha inicial de exemplo em uso. Altere em Perfil > Configurações.", "#EAB308")
         uf_selecionada = u_obj.get("uf_padrao", "RS")
         subregiao_selecionada = u_obj.get("subregiao_padrao", "Fronteira Oeste (São Borja / Itaqui / Uruguaiana)")
         polo_clima_sel = u_obj.get("polo_padrao", "RS • Fronteira Oeste (São Borja / Itaqui)")
@@ -2109,6 +2506,8 @@ def main(page: ft.Page):
         montar_sistema()
       else:
         tentativas_falhas += 1
+        if tentativas_falhas >= 5:
+          ultimo_bloqueio_login = time.monotonic()
         txt_erro_login.value = "❌ Utilizador ou palavra-passe incorretos."
         page.update()
 
@@ -2116,9 +2515,9 @@ def main(page: ft.Page):
         expand=True,
         alignment=ft.alignment.center,
         content=ft.Container(
-            width=540,
-            bgcolor="#111927",
-            padding=34,
+            width=largura_login,
+            bgcolor="#0E2030",
+            padding=18 if (page.width or 850) < 600 else 34,
             border_radius=28,
             border=ft.border.all(2, "#10B981"),
             content=ft.Column(
@@ -2135,13 +2534,13 @@ def main(page: ft.Page):
                         alignment=ft.alignment.center,
                         content=ft.Icon(ft.icons.SPA_ROUNDED, color="#080D16", size=54),
                     ),
-                    ft.Text("CR AgroStat Brasil v9.0", color="#FFFFFF", size=30, weight=ft.FontWeight.BOLD),
+                    ft.Text("CR AgroStat • Intelligence", color="#FFFFFF", size=22 if (page.width or 850) < 600 else 29, weight=ft.FontWeight.BOLD),
                     ft.Text("Chicago SRW Wheat Futures • StoneX • Mapa Geográfico • IA com Voz & Stories", color="#10B981", size=13, text_align=ft.TextAlign.CENTER),
                     inp_user,
                     inp_pass,
                     txt_erro_login,
-                    ft.ElevatedButton("🚀 Entrar no Sistema", bgcolor="#10B981", color="#080D16", width=360, height=48, on_click=fazer_login),
-                    ft.Text("Acesso Mestre: utilizador 'marcio' (ou 'carlise') | senha: Agro@2026", color="#38BDF8", size=12),
+                    ft.ElevatedButton("🚀 Entrar no Sistema", bgcolor="#10B981", color="#080D16", width=largura_campo_login, height=48, on_click=fazer_login),
+                    ft.Text("Acesso privado. Seus dados comerciais pertencem à sua conta.", color="#94A3B8", size=12),
                 ],
             ),
         ),
@@ -2263,7 +2662,7 @@ def main(page: ft.Page):
               max_y=round(max_v + amp * 0.25, 2),
               left_axis=ft.ChartAxis(labels_size=46),
               bottom_axis=ft.ChartAxis(labels=rotulos_x, labels_size=28),
-              horizontal_grid_lines=ft.ChartGridLines(interval=max(0.5, round(amp / 4, 1)), color="#1E293B", width=1),
+              horizontal_grid_lines=ft.ChartGridLines(interval=max(0.5, round(amp / 4, 1)), color="#21394C", width=1),
               tooltip_bgcolor="#0F172A",
               interactive=True,
           ),
@@ -2306,10 +2705,10 @@ def main(page: ft.Page):
         wrap=True,
         spacing=6,
         controls=[
-            ft.ElevatedButton("✓ 📈 Área" if est_atual == "area" else "📈 Área", bgcolor="#10B981" if est_atual == "area" else "#1E293B", color="#080D16" if est_atual == "area" else "#FFFFFF", height=28, on_click=lambda e: mudar_est_mini("area")),
-            ft.ElevatedButton("✓ 📐 Linha" if est_atual == "linha" else "📐 Linha", bgcolor="#10B981" if est_atual == "linha" else "#1E293B", color="#080D16" if est_atual == "linha" else "#FFFFFF", height=28, on_click=lambda e: mudar_est_mini("linha")),
-            ft.ElevatedButton("✓ 📊 Colunas" if est_atual == "colunas" else "📊 Colunas", bgcolor="#10B981" if est_atual == "colunas" else "#1E293B", color="#080D16" if est_atual == "colunas" else "#FFFFFF", height=28, on_click=lambda e: mudar_est_mini("colunas")),
-            ft.ElevatedButton("✓ 📉 Termómetro" if est_atual == "horizontal" else "📉 Termómetro", bgcolor="#10B981" if est_atual == "horizontal" else "#1E293B", color="#080D16" if est_atual == "horizontal" else "#FFFFFF", height=28, on_click=lambda e: mudar_est_mini("horizontal")),
+            ft.ElevatedButton("✓ 📈 Área" if est_atual == "area" else "📈 Área", bgcolor="#10B981" if est_atual == "area" else "#21394C", color="#080D16" if est_atual == "area" else "#FFFFFF", height=28, on_click=lambda e: mudar_est_mini("area")),
+            ft.ElevatedButton("✓ 📐 Linha" if est_atual == "linha" else "📐 Linha", bgcolor="#10B981" if est_atual == "linha" else "#21394C", color="#080D16" if est_atual == "linha" else "#FFFFFF", height=28, on_click=lambda e: mudar_est_mini("linha")),
+            ft.ElevatedButton("✓ 📊 Colunas" if est_atual == "colunas" else "📊 Colunas", bgcolor="#10B981" if est_atual == "colunas" else "#21394C", color="#080D16" if est_atual == "colunas" else "#FFFFFF", height=28, on_click=lambda e: mudar_est_mini("colunas")),
+            ft.ElevatedButton("✓ 📉 Termómetro" if est_atual == "horizontal" else "📉 Termómetro", bgcolor="#10B981" if est_atual == "horizontal" else "#21394C", color="#080D16" if est_atual == "horizontal" else "#FFFFFF", height=28, on_click=lambda e: mudar_est_mini("horizontal")),
         ],
     )
 
@@ -2320,7 +2719,7 @@ def main(page: ft.Page):
           controls=[
               ft.ElevatedButton(
                   f"✓ {it['sigla']}" if i == item_grafico_idx else it["sigla"],
-                  bgcolor=it["cor"] if i == item_grafico_idx else "#1E293B",
+                  bgcolor=it["cor"] if i == item_grafico_idx else "#21394C",
                   color="#080D16" if i == item_grafico_idx else "#E2E8F0",
                   height=28,
                   on_click=lambda e, idx=i: mudar_item_mini(idx),
@@ -2332,10 +2731,10 @@ def main(page: ft.Page):
           wrap=True,
           spacing=5,
           controls=[
-              ft.ElevatedButton("✓ 1D" if periodo_grafico == "diario" else "1D", bgcolor="#38BDF8" if periodo_grafico == "diario" else "#1E293B", color="#080D16" if periodo_grafico == "diario" else "#FFFFFF", height=28, on_click=lambda e: mudar_per_mini("diario")),
-              ft.ElevatedButton("✓ 7D" if periodo_grafico == "7d" else "7D", bgcolor="#38BDF8" if periodo_grafico == "7d" else "#1E293B", color="#080D16" if periodo_grafico == "7d" else "#FFFFFF", height=28, on_click=lambda e: mudar_per_mini("7d")),
-              ft.ElevatedButton("✓ 30D" if periodo_grafico == "30d" else "30D", bgcolor="#38BDF8" if periodo_grafico == "30d" else "#1E293B", color="#080D16" if periodo_grafico == "30d" else "#FFFFFF", height=28, on_click=lambda e: mudar_per_mini("30d")),
-              ft.ElevatedButton("✓ 🔮 +90D" if periodo_grafico == "90d" else "🔮 +90D", bgcolor="#FACC15" if periodo_grafico == "90d" else "#1E293B", color="#080D16" if periodo_grafico == "90d" else "#FACC15", height=28, on_click=lambda e: mudar_per_mini("90d")),
+              ft.ElevatedButton("✓ 1D" if periodo_grafico == "diario" else "1D", bgcolor="#38BDF8" if periodo_grafico == "diario" else "#21394C", color="#080D16" if periodo_grafico == "diario" else "#FFFFFF", height=28, on_click=lambda e: mudar_per_mini("diario")),
+              ft.ElevatedButton("✓ 7D" if periodo_grafico == "7d" else "7D", bgcolor="#38BDF8" if periodo_grafico == "7d" else "#21394C", color="#080D16" if periodo_grafico == "7d" else "#FFFFFF", height=28, on_click=lambda e: mudar_per_mini("7d")),
+              ft.ElevatedButton("✓ 30D" if periodo_grafico == "30d" else "30D", bgcolor="#38BDF8" if periodo_grafico == "30d" else "#21394C", color="#080D16" if periodo_grafico == "30d" else "#FFFFFF", height=28, on_click=lambda e: mudar_per_mini("30d")),
+              ft.ElevatedButton("✓ 🔮 +90D" if periodo_grafico == "90d" else "🔮 +90D", bgcolor="#FACC15" if periodo_grafico == "90d" else "#21394C", color="#080D16" if periodo_grafico == "90d" else "#FACC15", height=28, on_click=lambda e: mudar_per_mini("90d")),
           ],
       )
     else:
@@ -2343,18 +2742,18 @@ def main(page: ft.Page):
           wrap=True,
           spacing=5,
           controls=[
-              ft.ElevatedButton("✓ 📅 10 Dias" if periodo_clima_grafico == "10d" else "📅 10 Dias", bgcolor="#38BDF8" if periodo_clima_grafico == "10d" else "#1E293B", color="#080D16" if periodo_clima_grafico == "10d" else "#FFFFFF", height=28, on_click=lambda e: mudar_per_mini("10d")),
-              ft.ElevatedButton("✓ 🔮 Previsão Futura (+90d)" if periodo_clima_grafico == "futuro_ia" else "🔮 Previsão Futura (+90d)", bgcolor="#FACC15" if periodo_clima_grafico == "futuro_ia" else "#1E293B", color="#080D16" if periodo_clima_grafico == "futuro_ia" else "#FACC15", height=28, on_click=lambda e: mudar_per_mini("futuro_ia")),
-              ft.ElevatedButton("✓ 📊 Anos Anteriores" if periodo_clima_grafico == "estacoes_anos" else "📊 Anos Anteriores", bgcolor="#10B981" if periodo_clima_grafico == "estacoes_anos" else "#1E293B", color="#080D16" if periodo_clima_grafico == "estacoes_anos" else "#FFFFFF", height=28, on_click=lambda e: mudar_per_mini("estacoes_anos")),
+              ft.ElevatedButton("✓ 📅 10 Dias" if periodo_clima_grafico == "10d" else "📅 10 Dias", bgcolor="#38BDF8" if periodo_clima_grafico == "10d" else "#21394C", color="#080D16" if periodo_clima_grafico == "10d" else "#FFFFFF", height=28, on_click=lambda e: mudar_per_mini("10d")),
+              ft.ElevatedButton("✓ 🔮 Previsão Futura (+90d)" if periodo_clima_grafico == "futuro_ia" else "🔮 Previsão Futura (+90d)", bgcolor="#FACC15" if periodo_clima_grafico == "futuro_ia" else "#21394C", color="#080D16" if periodo_clima_grafico == "futuro_ia" else "#FACC15", height=28, on_click=lambda e: mudar_per_mini("futuro_ia")),
+              ft.ElevatedButton("✓ 📊 Anos Anteriores" if periodo_clima_grafico == "estacoes_anos" else "📊 Anos Anteriores", bgcolor="#10B981" if periodo_clima_grafico == "estacoes_anos" else "#21394C", color="#080D16" if periodo_clima_grafico == "estacoes_anos" else "#FFFFFF", height=28, on_click=lambda e: mudar_per_mini("estacoes_anos")),
           ],
       )
       botoes_periodo_mini = ft.Container()
 
     return ft.Container(
-        bgcolor="#0B111E",
+        bgcolor="#0A1826",
         padding=14,
         border_radius=18,
-        border=ft.border.all(1.5, "#1E293B"),
+        border=ft.border.all(1.5, "#21394C"),
         content=ft.Column(
             spacing=8,
             controls=[
@@ -2363,7 +2762,7 @@ def main(page: ft.Page):
                 chips_seletor,
                 botoes_formato,
                 botoes_periodo_mini,
-                ft.Container(bgcolor="#111927", padding=10, border_radius=14, content=grafico_widget),
+                ft.Container(bgcolor="#0E2030", padding=10, border_radius=14, content=grafico_widget),
             ],
         ),
     )
@@ -2375,7 +2774,11 @@ def main(page: ft.Page):
     nonlocal pino_mapa_selecionado, uf_selecionada, subregiao_selecionada, polo_clima_sel
     u_atual = db_usuarios["usuarios"].get(usuario_logado_key, {})
     clientes_u = u_atual.get("clientes", [])
-    svg_b64 = gerar_svg_geografico_estados_brasil_b64(uf_selecionada)
+    svg_b64 = mapa_brasil_ibge_b64(uf_selecionada)
+    mapa_oficial = bool(svg_b64)
+    if not svg_b64:
+      # Modo de contingência sem internet: desenho antigo só como esquema ilustrativo.
+      svg_b64 = gerar_svg_geografico_estados_brasil_b64(uf_selecionada)
 
     def selecionar_polo_mapa(nome_p, info_p):
       nonlocal pino_mapa_selecionado, uf_selecionada, subregiao_selecionada, polo_clima_sel
@@ -2408,8 +2811,21 @@ def main(page: ft.Page):
       }
       renderizar()
 
+    largura_base = 720 if mapa_oficial else 650
+    altura_base = 700 if mapa_oficial else 580
+    # Ajusta desenho e pinos juntos: nenhum elemento perde a posição GPS.
+    tela_largura = page.width or 1200
+    if tela_largura < 825:
+      largura_disponivel = max(260, tela_largura - 62)
+    elif tela_largura < 1350:
+      largura_disponivel = max(330, (tela_largura - 365) * 0.55)
+    else:
+      largura_disponivel = min(650, (tela_largura - 370) * 0.55)
+    escala_mapa = min(1.0, largura_disponivel / largura_base)
+    largura_mapa = round(largura_base * escala_mapa)
+    altura_mapa = round(altura_base * escala_mapa)
     controles_stack = [
-        ft.Image(src_base64=svg_b64, width=640, height=560, fit=ft.ImageFit.CONTAIN),
+        ft.Image(src_base64=svg_b64, width=largura_mapa, height=altura_mapa, fit=ft.ImageFit.CONTAIN),
     ]
 
     for nome_p, info_p in POLOS_CLIMA_BRASIL.items():
@@ -2419,45 +2835,49 @@ def main(page: ft.Page):
       cor_txt = "#080D16" if ativo_p or eh_sb else "#38BDF8"
       sigla_pino = info_p["uf"] + " • " + nome_p.split("(")[1].split("/")[0].replace(")", "").strip()
 
+      x, y = coordenada_mapa(info_p["lat"], info_p["lon"]) if mapa_oficial else (info_p["mapa_x"], info_p["mapa_y"])
       controles_stack.append(
           ft.Container(
-              left=info_p["mapa_x"] - 45,
-              top=info_p["mapa_y"] - 14,
-              content=ft.ElevatedButton(
-                  f"✓ 📍 {sigla_pino}" if ativo_p else f"📍 {sigla_pino}",
-                  bgcolor=cor_bg,
-                  color=cor_txt,
-                  height=26,
-                  style=ft.ButtonStyle(
-                      padding=ft.padding.symmetric(horizontal=8, vertical=2),
-                      side={"": ft.BorderSide(2 if ativo_p else 1, "#FACC15" if ativo_p else "#38BDF8")},
-                  ),
+              left=max(2, (x - 11) * escala_mapa),
+              top=max(2, (y - 11) * escala_mapa),
+              tooltip=nome_p,
+              content=ft.IconButton(
+                  icon=ft.icons.LOCATION_ON_ROUNDED,
+                  icon_color="#FACC15" if ativo_p else "#38BDF8",
+                  icon_size=(22 if ativo_p else 17) if escala_mapa < 0.75 else (26 if ativo_p else 20),
+                  bgcolor="#164E43" if ativo_p else "#0B2334",
                   on_click=lambda e, np=nome_p, ip=info_p: selecionar_polo_mapa(np, ip),
               ),
           )
       )
 
-    for idx_c, cli in enumerate(clientes_u[:3]):
-      controles_stack.append(
-          ft.Container(
-              left=180 + (idx_c * 14),
-              top=435 - (idx_c * 28),
-              content=ft.ElevatedButton(
-                  f"🚜 {cli['nome'][:15]}",
-                  bgcolor="#FACC15",
-                  color="#080D16",
-                  height=25,
-                  on_click=lambda e, c=cli: selecionar_cliente_mapa(c),
-              ),
-          )
-      )
+    if mapa_oficial:
+      for idx_c, cli in enumerate(clientes_u):
+        try:
+          x,y = coordenada_mapa(float(cli["lat_lavoura"]), float(cli["lon_lavoura"]))
+          x, y = x * escala_mapa, y * escala_mapa
+          if not (5 < x < largura_mapa - 5 and 5 < y < altura_mapa - 5):
+            continue
+          controles_stack.append(ft.Container(left=x-12, top=y-12, tooltip=cli.get("nome", "Cliente"),
+              content=ft.IconButton(icon=ft.icons.AGRICULTURE_ROUNDED,
+                  icon_color="#FACC15", icon_size=24, bgcolor="#3F3412",
+                  on_click=lambda e, c=cli: selecionar_cliente_mapa(c))))
+        except (ValueError, TypeError, KeyError):
+          continue
 
     return ft.Container(
         bgcolor="#060B14",
         border_radius=22,
-        border=ft.border.all(1.5, "#1E293B"),
+        border=ft.border.all(1.5, "#21394C"),
         alignment=ft.alignment.center,
-        content=ft.Stack(width=640, height=560, controls=controles_stack),
+        content=ft.Column(spacing=6, controls=[
+            ft.Text("Malha IBGE • pinos posicionados por GPS • zoom e arraste" if mapa_oficial else
+                    "Mapa ilustrativo offline. Conecte à internet para baixar a malha IBGE.",
+                    size=11, color="#A7F3D0" if mapa_oficial else "#FACC15"),
+            ft.InteractiveViewer(min_scale=0.42, max_scale=4.0, constrained=False,
+                content=ft.Stack(width=largura_mapa, height=altura_mapa, controls=controles_stack),
+                height=min(510, altura_mapa + 8)),
+        ]),
     )
 
   # =========================================================================
@@ -2550,7 +2970,7 @@ def main(page: ft.Page):
       chips_itens.controls.append(
           ft.ElevatedButton(
               f"✓ {it['sigla']} (R$ {pr_it:.2f})" if ativo else f"{it['sigla']} (R$ {pr_it:.2f})",
-              bgcolor=it["cor"] if ativo else "#1E293B",
+              bgcolor=it["cor"] if ativo else "#21394C",
               color="#080D16" if ativo else "#E2E8F0",
               height=38,
               on_click=lambda e, i=idx: sel_item_graf(i),
@@ -2565,7 +2985,7 @@ def main(page: ft.Page):
       barra_fontes_clicaveis.controls.append(
           ft.ElevatedButton(
               f"✓ {info_f['sigla_btn']}" if at_f else info_f["sigla_btn"],
-              bgcolor="#10B981" if at_f else "#1E293B",
+              bgcolor="#10B981" if at_f else "#21394C",
               color="#080D16" if at_f else "#38BDF8",
               height=32,
               on_click=lambda e, k=ch_f: sel_fonte_clicavel(k),
@@ -2580,10 +3000,10 @@ def main(page: ft.Page):
     info_fonte_atual = FONTES_DISPONIVEIS.get(fonte_analise_ativa, list(FONTES_DISPONIVEIS.values())[0])
 
     bloco_valor_gigante = ft.Container(
-        bgcolor="#0B111E",
+        bgcolor="#0A1826",
         padding=20,
         border_radius=20,
-        border=ft.border.all(1.5, "#1E293B"),
+        border=ft.border.all(1.5, "#21394C"),
         content=ft.Column(
             spacing=10,
             controls=[
@@ -2601,14 +3021,14 @@ def main(page: ft.Page):
                             spacing=8,
                             controls=[
                                 ft.Container(
-                                    bgcolor="#1E293B",
+                                    bgcolor="#21394C",
                                     padding=ft.padding.symmetric(horizontal=10, vertical=4),
                                     border_radius=8,
                                     content=ft.Text(item_sel["codigo_cbot"], color="#FACC15", size=13, weight=ft.FontWeight.BOLD),
                                 ),
                                 ft.ElevatedButton(
                                     "🌐 Abrir Portal Oficial",
-                                    bgcolor="#111927",
+                                    bgcolor="#0E2030",
                                     color="#38BDF8",
                                     height=30,
                                     on_click=lambda e: page.launch_url(info_fonte_atual["url"]),
@@ -2654,7 +3074,7 @@ def main(page: ft.Page):
                             spacing=10,
                             controls=[
                                 ft.Container(
-                                    bgcolor="#111927",
+                                    bgcolor="#0E2030",
                                     padding=10,
                                     border_radius=12,
                                     border=ft.border.all(1, "#10B981"),
@@ -2672,7 +3092,7 @@ def main(page: ft.Page):
                                     ),
                                 ),
                                 ft.Container(
-                                    bgcolor="#111927",
+                                    bgcolor="#0E2030",
                                     padding=10,
                                     border_radius=12,
                                     border=ft.border.all(1, "#FACC15"),
@@ -2696,7 +3116,7 @@ def main(page: ft.Page):
                 ),
                 # Destaque Informativo StoneX & Inteligência de Mercado
                 ft.Container(
-                    bgcolor="#111927",
+                    bgcolor="#0E2030",
                     padding=10,
                     border_radius=10,
                     border=ft.border.all(1, "#38BDF8"),
@@ -2732,7 +3152,7 @@ def main(page: ft.Page):
       botoes_per.controls.append(
           ft.ElevatedButton(
               f"✓ {rot_p}" if at_p else rot_p,
-              bgcolor=cor_p if at_p else "#1E293B",
+              bgcolor=cor_p if at_p else "#21394C",
               color="#080D16" if at_p else "#FFFFFF",
               height=32,
               on_click=lambda e, pe=cod_p: sel_periodo_graf(pe),
@@ -2751,7 +3171,7 @@ def main(page: ft.Page):
       botoes_estilo.controls.append(
           ft.ElevatedButton(
               f"✓ {rot_e}" if at_e else rot_e,
-              bgcolor="#10B981" if at_e else "#1E293B",
+              bgcolor="#10B981" if at_e else "#21394C",
               color="#080D16" if at_e else "#FFFFFF",
               height=32,
               on_click=lambda e, es=cod_e: sel_estilo_graf(es),
@@ -2799,7 +3219,7 @@ def main(page: ft.Page):
               max_y=round(max_val + amplitude * 0.25, 2),
               left_axis=ft.ChartAxis(labels_size=56),
               bottom_axis=ft.ChartAxis(labels=rotulos_x, labels_size=30),
-              horizontal_grid_lines=ft.ChartGridLines(interval=max(0.15, round(amplitude / 4, 2)), color="#1E293B", width=1),
+              horizontal_grid_lines=ft.ChartGridLines(interval=max(0.15, round(amplitude / 4, 2)), color="#21394C", width=1),
               tooltip_bgcolor="#0F172A",
               interactive=True,
           ),
@@ -2845,10 +3265,10 @@ def main(page: ft.Page):
 
     # Grelha dos 6 Indicadores Oficiais Chicago SRW
     grelha_6_indicadores_cbot = ft.Container(
-        bgcolor="#0B111E",
+        bgcolor="#0A1826",
         padding=14,
         border_radius=16,
-        border=ft.border.all(1, "#1E293B"),
+        border=ft.border.all(1, "#21394C"),
         content=ft.ResponsiveRow(
             spacing=14,
             run_spacing=8,
@@ -2893,10 +3313,10 @@ def main(page: ft.Page):
     p90_uf = round(item_sel["prev_90d"] * fator_escala, 2)
 
     return ft.Container(
-        bgcolor="#111927",
+        bgcolor="#0E2030",
         padding=20,
         border_radius=24,
-        border=ft.border.all(1.5, "#1E293B"),
+        border=ft.border.all(1.5, "#21394C"),
         content=ft.Column(
             spacing=12,
             controls=[
@@ -2905,20 +3325,20 @@ def main(page: ft.Page):
                 barra_fontes_clicaveis,
                 bloco_valor_gigante,
                 ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN, wrap=True, controls=[botoes_per, botoes_estilo]),
-                ft.Container(bgcolor="#0B111E", padding=14, border_radius=18, border=ft.border.all(1, "#1E293B"), content=widget_grafico),
+                ft.Container(bgcolor="#0A1826", padding=14, border_radius=18, border=ft.border.all(1, "#21394C"), content=widget_grafico),
                 grelha_6_indicadores_cbot,
                 ft.Container(
-                    bgcolor="#0B111E",
+                    bgcolor="#0A1826",
                     padding=14,
                     border_radius=16,
                     border=ft.border.all(1.5, "#FACC15"),
                     content=ft.ResponsiveRow(
                         spacing=10,
                         controls=[
-                            ft.Container(col={"xs": 6, "md": 3}, bgcolor="#111927", padding=10, border_radius=10, content=ft.Column([ft.Text("ESTIMATIVA +15 DIAS", color="#94A3B8", size=10), ft.Text(f"R$ {p15_uf:.2f}", color="#38BDF8", size=18, weight=ft.FontWeight.BOLD)])),
-                            ft.Container(col={"xs": 6, "md": 3}, bgcolor="#111927", padding=10, border_radius=10, content=ft.Column([ft.Text("ESTIMATIVA +30 DIAS", color="#94A3B8", size=10), ft.Text(f"R$ {p30_uf:.2f}", color="#A855F7", size=18, weight=ft.FontWeight.BOLD)])),
-                            ft.Container(col={"xs": 6, "md": 3}, bgcolor="#111927", padding=10, border_radius=10, content=ft.Column([ft.Text("ESTIMATIVA +60 DIAS", color="#94A3B8", size=10), ft.Text(f"R$ {p60_uf:.2f}", color="#10B981", size=18, weight=ft.FontWeight.BOLD)])),
-                            ft.Container(col={"xs": 6, "md": 3}, bgcolor="#111927", padding=10, border_radius=10, content=ft.Column([ft.Text("ESTIMATIVA +90 DIAS", color="#FACC15", size=10), ft.Text(f"R$ {p90_uf:.2f}", color="#FACC15", size=18, weight=ft.FontWeight.BOLD)])),
+                            ft.Container(col={"xs": 6, "md": 3}, bgcolor="#0E2030", padding=10, border_radius=10, content=ft.Column([ft.Text("ESTIMATIVA +15 DIAS", color="#94A3B8", size=10), ft.Text(f"R$ {p15_uf:.2f}", color="#38BDF8", size=18, weight=ft.FontWeight.BOLD)])),
+                            ft.Container(col={"xs": 6, "md": 3}, bgcolor="#0E2030", padding=10, border_radius=10, content=ft.Column([ft.Text("ESTIMATIVA +30 DIAS", color="#94A3B8", size=10), ft.Text(f"R$ {p30_uf:.2f}", color="#A855F7", size=18, weight=ft.FontWeight.BOLD)])),
+                            ft.Container(col={"xs": 6, "md": 3}, bgcolor="#0E2030", padding=10, border_radius=10, content=ft.Column([ft.Text("ESTIMATIVA +60 DIAS", color="#94A3B8", size=10), ft.Text(f"R$ {p60_uf:.2f}", color="#10B981", size=18, weight=ft.FontWeight.BOLD)])),
+                            ft.Container(col={"xs": 6, "md": 3}, bgcolor="#0E2030", padding=10, border_radius=10, content=ft.Column([ft.Text("ESTIMATIVA +90 DIAS", color="#FACC15", size=10), ft.Text(f"R$ {p90_uf:.2f}", color="#FACC15", size=18, weight=ft.FontWeight.BOLD)])),
                         ],
                     ),
                 ),
@@ -2936,14 +3356,15 @@ def main(page: ft.Page):
     url_waze_rota = f"https://waze.com/ul?ll={lat_sel},{lon_sel}&navigate=yes"
 
     return ft.Container(
-        bgcolor="#111927",
+        bgcolor="#0E2030",
         padding=20,
         border_radius=24,
-        border=ft.border.all(1.5, "#1E293B"),
+        border=ft.border.all(1.5, "#21394C"),
         content=ft.Column(
             spacing=14,
             controls=[
-                ft.Text("🗺️ Mapa Geográfico Real do Brasil — Estados, Microrregiões & Lavouras GPS", color="#FFFFFF", size=20, weight=ft.FontWeight.BOLD),
+                ft.Text("🗺️ Brasil Cartográfico | Estados & Lavouras", color="#FFFFFF", size=20, weight=ft.FontWeight.BOLD),
+                ft.Text("Limites de estados com malha IBGE • pinos georreferenciados conforme coordenadas cadastradas.", color="#94A3B8", size=12),
                 construir_seletor_triplo_regioes(),
                 ft.ResponsiveRow(
                     spacing=16,
@@ -2956,7 +3377,7 @@ def main(page: ft.Page):
                                 controls=[
                                     construir_mini_painel_grafico_mapa(modo_clima=False),
                                     ft.Container(
-                                        bgcolor="#0B111E",
+                                        bgcolor="#0A1826",
                                         padding=16,
                                         border_radius=18,
                                         border=ft.border.all(1.5, "#10B981"),
@@ -3012,9 +3433,9 @@ def main(page: ft.Page):
 
     # Cabeçalho Estilo Facebook com Foto Quadrada Arredondada Gigante (142x142)
     header_facebook = ft.Container(
-        bgcolor="#111927",
+        bgcolor="#0E2030",
         border_radius=24,
-        border=ft.border.all(1.5, "#1E293B"),
+        border=ft.border.all(1.5, "#21394C"),
         clip_behavior=ft.ClipBehavior.HARD_EDGE,
         content=ft.Column(
             spacing=0,
@@ -3031,8 +3452,8 @@ def main(page: ft.Page):
                     content=ft.Row(
                         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                         controls=[
-                            ft.Container(bgcolor="#0B111E", padding=8, border_radius=10, content=ft.Text(f"📍 Praça Padrão: {u_atual.get('cidade_padrao', 'São Borja - RS')}", color="#10B981", size=12, weight=ft.FontWeight.BOLD)),
-                            ft.Container(bgcolor="#0B111E", padding=8, border_radius=10, content=ft.Text(f"📚 Fonte Base: {fonte_analise_ativa}", color="#FACC15", size=12, weight=ft.FontWeight.BOLD)),
+                            ft.Container(bgcolor="#0A1826", padding=8, border_radius=10, content=ft.Text(f"📍 Praça Padrão: {u_atual.get('cidade_padrao', 'São Borja - RS')}", color="#10B981", size=12, weight=ft.FontWeight.BOLD)),
+                            ft.Container(bgcolor="#0A1826", padding=8, border_radius=10, content=ft.Text(f"📚 Fonte Base: {fonte_analise_ativa}", color="#FACC15", size=12, weight=ft.FontWeight.BOLD)),
                         ],
                     ),
                 ),
@@ -3070,26 +3491,26 @@ def main(page: ft.Page):
                                 spacing=8,
                                 wrap=True,
                                 controls=[
-                                    ft.ElevatedButton("📸 Escolher Minha Foto Pessoal", bgcolor="#10B981", color="#080D16", height=40, on_click=lambda e: seletor_foto.pick_files(allow_multiple=False)),
-                                    ft.ElevatedButton("⚙️ Fontes & Sites", bgcolor="#1E293B", color="#FACC15", height=40, on_click=lambda e: mudar_sub_perfil("admin_supa")),
+                                    ft.ElevatedButton("📸 Escolher Minha Foto Pessoal", bgcolor="#10B981", color="#080D16", height=40, on_click=escolher_foto),
+                                    ft.ElevatedButton("⚙️ Fontes & Sites", bgcolor="#21394C", color="#FACC15", height=40, on_click=lambda e: mudar_sub_perfil("admin_supa")),
                                     ft.ElevatedButton("🔒 Sair", bgcolor="#450A0A", color="#FCA5A5", height=40, on_click=sair_logout),
                                 ],
                             ),
                         ],
                     ),
                 ),
-                ft.Divider(height=1, color="#1E293B"),
+                ft.Divider(height=1, color="#21394C"),
                 ft.Container(
-                    bgcolor="#0B111E",
+                    bgcolor="#0A1826",
                     padding=ft.padding.symmetric(horizontal=20, vertical=10),
                     content=ft.Row(
                         wrap=True,
                         spacing=10,
                         controls=[
-                            ft.ElevatedButton("✓ 🚜 Clientes, Histórico de Parceria & Mapa GPS" if sub_aba_perfil == "clientes" else "🚜 Clientes, Histórico de Parceria & Mapa GPS", bgcolor="#10B981" if sub_aba_perfil == "clientes" else "#1E293B", color="#080D16" if sub_aba_perfil == "clientes" else "#FFFFFF", height=38, on_click=lambda e: mudar_sub_perfil("clientes")),
-                            ft.ElevatedButton("✓ 📰 Mural & Agenda de Vendas" if sub_aba_perfil == "agenda" else "📰 Mural & Agenda de Vendas", bgcolor="#10B981" if sub_aba_perfil == "agenda" else "#1E293B", color="#080D16" if sub_aba_perfil == "agenda" else "#FFFFFF", height=38, on_click=lambda e: mudar_sub_perfil("agenda")),
-                            ft.ElevatedButton(f"✓ 🔔 Alertas de Preço ({len(alertas_u)})" if sub_aba_perfil == "alertas" else f"🔔 Alertas de Preço ({len(alertas_u)})", bgcolor="#FACC15" if sub_aba_perfil == "alertas" else "#1E293B", color="#080D16" if sub_aba_perfil == "alertas" else "#FACC15", height=38, on_click=lambda e: mudar_sub_perfil("alertas")),
-                            ft.ElevatedButton("✓ ⚙️ Fontes Padrão, StoneX & Senha" if sub_aba_perfil == "admin_supa" else "⚙️ Fontes Padrão, StoneX & Senha", bgcolor="#38BDF8" if sub_aba_perfil == "admin_supa" else "#1E293B", color="#080D16" if sub_aba_perfil == "admin_supa" else "#FFFFFF", height=38, on_click=lambda e: mudar_sub_perfil("admin_supa")),
+                            ft.ElevatedButton("✓ 🚜 Clientes, Histórico de Parceria & Mapa GPS" if sub_aba_perfil == "clientes" else "🚜 Clientes, Histórico de Parceria & Mapa GPS", bgcolor="#10B981" if sub_aba_perfil == "clientes" else "#21394C", color="#080D16" if sub_aba_perfil == "clientes" else "#FFFFFF", height=38, on_click=lambda e: mudar_sub_perfil("clientes")),
+                            ft.ElevatedButton("✓ 📰 Mural & Agenda de Vendas" if sub_aba_perfil == "agenda" else "📰 Mural & Agenda de Vendas", bgcolor="#10B981" if sub_aba_perfil == "agenda" else "#21394C", color="#080D16" if sub_aba_perfil == "agenda" else "#FFFFFF", height=38, on_click=lambda e: mudar_sub_perfil("agenda")),
+                            ft.ElevatedButton(f"✓ 🔔 Alertas de Preço ({len(alertas_u)})" if sub_aba_perfil == "alertas" else f"🔔 Alertas de Preço ({len(alertas_u)})", bgcolor="#FACC15" if sub_aba_perfil == "alertas" else "#21394C", color="#080D16" if sub_aba_perfil == "alertas" else "#FACC15", height=38, on_click=lambda e: mudar_sub_perfil("alertas")),
+                            ft.ElevatedButton("✓ ⚙️ Fontes Padrão, StoneX & Senha" if sub_aba_perfil == "admin_supa" else "⚙️ Fontes Padrão, StoneX & Senha", bgcolor="#38BDF8" if sub_aba_perfil == "admin_supa" else "#21394C", color="#080D16" if sub_aba_perfil == "admin_supa" else "#FFFFFF", height=38, on_click=lambda e: mudar_sub_perfil("admin_supa")),
                         ],
                     ),
                 ),
@@ -3098,23 +3519,23 @@ def main(page: ft.Page):
     )
 
     coluna_apresentacao_esq = ft.Container(
-        bgcolor="#111927",
+        bgcolor="#0E2030",
         padding=18,
         border_radius=20,
-        border=ft.border.all(1, "#1E293B"),
+        border=ft.border.all(1, "#21394C"),
         content=ft.Column(
             spacing=10,
             controls=[
                 ft.Text("📌 Apresentação & Estatísticas da Carteira", color="#FFFFFF", size=16, weight=ft.FontWeight.BOLD),
                 ft.Text(u_atual.get("bio", ""), color="#CBD5E1", size=12),
-                ft.Divider(color="#1E293B"),
+                ft.Divider(color="#21394C"),
                 ft.Text(f"📍 Sede Padrão: {u_atual.get('cidade_padrao', 'São Borja - RS')}", color="#10B981", size=13, weight=ft.FontWeight.BOLD),
                 ft.Text(f"🌾 Área Total Assistida: {sum(c.get('hectares_soja', 0)+c.get('hectares_arroz', 0) for c in clientes_u):,.0f} ha", color="#38BDF8", size=13, weight=ft.FontWeight.BOLD),
                 ft.Text(f"🤝 Volume Histórico Parcerias: R$ {sum(c.get('total_acumulado_reais', 0) for c in clientes_u):,.2f}", color="#FACC15", size=13, weight=ft.FontWeight.BOLD),
-                ft.Divider(color="#1E293B"),
+                ft.Divider(color="#21394C"),
                 ft.Text("🚀 Ações Rápidas:", color="#FFFFFF", size=13, weight=ft.FontWeight.BOLD),
-                ft.ElevatedButton("📸 Gerar Card Stories do Dia", bgcolor="#1E293B", color="#10B981", width=float("inf"), on_click=lambda e: mudar_aba("stories")),
-                ft.ElevatedButton("🤖 Consultar IA com Voz", bgcolor="#1E293B", color="#FACC15", width=float("inf"), on_click=lambda e: mudar_aba("ia_voz")),
+                ft.ElevatedButton("📸 Gerar Card Stories do Dia", bgcolor="#21394C", color="#10B981", width=float("inf"), on_click=lambda e: mudar_aba("stories")),
+                ft.ElevatedButton("🤖 Consultar IA com Voz", bgcolor="#21394C", color="#FACC15", width=float("inf"), on_click=lambda e: mudar_aba("ia_voz")),
             ],
         ),
     )
@@ -3123,19 +3544,27 @@ def main(page: ft.Page):
 
     # SUB-ABA CLIENTES: COM ESTATÍSTICAS DE PARCERIA, HISTÓRICO DE SAFRAS E MAPA LOCAL INTEGRADO
     if sub_aba_perfil == "clientes":
-      c_nome = ft.TextField(label="Nome do Produtor / Escritório", bgcolor="#0B111E", color="#FFFFFF", width=230)
-      c_prop = ft.TextField(label="Fazenda / Sede no Interior", bgcolor="#0B111E", color="#FFFFFF", width=210)
-      c_cid = ft.TextField(label="Município - UF", value="São Borja - RS", bgcolor="#0B111E", color="#FFFFFF", width=150)
-      c_zap = ft.TextField(label="WhatsApp", value="5555999887766", bgcolor="#0B111E", color="#FFFFFF", width=150)
-      c_soja = ft.TextField(label="Soja (ha)", value="450", bgcolor="#0B111E", color="#FFFFFF", width=105)
-      c_arroz = ft.TextField(label="Arroz (ha)", value="300", bgcolor="#0B111E", color="#FFFFFF", width=105)
-      c_rot = ft.TextField(label="Roteiro da Lavoura no Interior", value="BR-472 km 18, entrada à esquerda", bgcolor="#0B111E", color="#FFFFFF", width=250)
-      c_lat = ft.TextField(label="Latitude GPS", value="-28.725", bgcolor="#0B111E", color="#FFFFFF", width=125)
-      c_lon = ft.TextField(label="Longitude GPS", value="-55.910", bgcolor="#0B111E", color="#FFFFFF", width=125)
-      c_hist = ft.TextField(label="Resumo Histórico da Parceria / Safras Anteriores", value="Safra 2024/25: 1.500 sc Soja + 200 sc Semente TSI", bgcolor="#0B111E", color="#FFFFFF", width=380)
+      c_nome = ft.TextField(label="Nome do Produtor / Escritório", bgcolor="#0A1826", color="#FFFFFF", width=230)
+      c_prop = ft.TextField(label="Fazenda / Sede no Interior", bgcolor="#0A1826", color="#FFFFFF", width=210)
+      c_cid = ft.TextField(label="Município - UF", value="São Borja - RS", bgcolor="#0A1826", color="#FFFFFF", width=150)
+      c_zap = ft.TextField(label="WhatsApp", value="5555999887766", bgcolor="#0A1826", color="#FFFFFF", width=150)
+      c_soja = ft.TextField(label="Soja (ha)", value="450", bgcolor="#0A1826", color="#FFFFFF", width=105)
+      c_arroz = ft.TextField(label="Arroz (ha)", value="300", bgcolor="#0A1826", color="#FFFFFF", width=105)
+      c_rot = ft.TextField(label="Roteiro da Lavoura no Interior", value="BR-472 km 18, entrada à esquerda", bgcolor="#0A1826", color="#FFFFFF", width=250)
+      c_lat = ft.TextField(label="Latitude GPS", value="-28.725", bgcolor="#0A1826", color="#FFFFFF", width=125)
+      c_lon = ft.TextField(label="Longitude GPS", value="-55.910", bgcolor="#0A1826", color="#FFFFFF", width=125)
+      c_hist = ft.TextField(label="Resumo Histórico da Parceria / Safras Anteriores", value="Safra 2024/25: 1.500 sc Soja + 200 sc Semente TSI", bgcolor="#0A1826", color="#FFFFFF", width=380)
 
       def salvar_cli(e):
         if not c_nome.value.strip():
+          return
+        try:
+          lat_in = numero_usuario(c_lat.value, -35, 6)
+          lon_in = numero_usuario(c_lon.value, -75, -30)
+          ha_soja = numero_usuario(c_soja.value or 0, 0)
+          ha_arroz = numero_usuario(c_arroz.value or 0, 0)
+        except (TypeError, ValueError):
+          mostrar_aviso("Confira hectares e coordenadas GPS (latitude/longitude).", "#EF4444")
           return
         clientes_u.insert(0, {
             "id": f"cli_{len(clientes_u)+1}",
@@ -3145,20 +3574,20 @@ def main(page: ft.Page):
             "cidade_uf": c_cid.value.strip(),
             "cpf_cnpj": "",
             "whatsapp": "".join(ch for ch in c_zap.value if ch.isdigit()),
-            "hectares_soja": float(c_soja.value or 0),
-            "hectares_arroz": float(c_arroz.value or 0),
+            "hectares_soja": ha_soja,
+            "hectares_arroz": ha_arroz,
             "hectares_inverno": 200,
             "tem_silo": "Sim (Silo Próprio)",
             "endereco_escritorio": f"Centro, {c_cid.value.strip()}",
             "lat_escritorio": -28.66,
             "lon_escritorio": -56.00,
             "roteiro_lavoura": c_rot.value.strip(),
-            "lat_lavoura": float(c_lat.value.replace(",", ".")),
-            "lon_lavoura": float(c_lon.value.replace(",", ".")),
+            "lat_lavoura": lat_in,
+            "lon_lavoura": lon_in,
             "anos_parceria": "Parceria Ativa Registrada",
             "indice_fidelidade": "100% (Cliente Fidelizado)",
-            "total_acumulado_sacas": 1700,
-            "total_acumulado_reais": 235000.00,
+            "total_acumulado_sacas": 0,
+            "total_acumulado_reais": 0.00,
             "historico_parceria": [c_hist.value.strip()],
         })
         salvar_banco_usuarios(db_usuarios)
@@ -3166,16 +3595,17 @@ def main(page: ft.Page):
         renderizar()
 
       cards_clientes_completos = ft.Column(spacing=14)
+      campo_pesquisa_clientes = ft.TextField(label="🔎 Buscar cliente / fazenda / cidade", hint_text="Digite para filtrar sua carteira", width=410)
+      index_clientes = []
+      def filtrar_clientes(e):
+        busca = (campo_pesquisa_clientes.value or "").casefold().strip()
+        for controle, texto in index_clientes:
+          controle.visible = busca in texto
+        page.update()
+      campo_pesquisa_clientes.on_change = filtrar_clientes
       for c in clientes_u:
         lat_l = float(c.get("lat_lavoura", -28.725))
         lon_l = float(c.get("lon_lavoura", -55.910))
-        svg_mapa_cli = gerar_svg_geografico_estados_brasil_b64(
-            modo_local_cliente=True,
-            lat_cli=lat_l,
-            lon_cli=lon_l,
-            nome_cli=c["nome"],
-            roteiro_cli=c.get("roteiro_lavoura", ""),
-        )
         sacas_sem_soja = int((c.get("hectares_soja", 0) * 65) / 40)
         sacas_sem_arroz = int((c.get("hectares_arroz", 0) * 100) / 40)
 
@@ -3193,10 +3623,10 @@ def main(page: ft.Page):
 
         cards_clientes_completos.controls.append(
             ft.Container(
-                bgcolor="#111927",
+                bgcolor="#0E2030",
                 padding=20,
                 border_radius=22,
-                border=ft.border.all(1.5, "#1E293B"),
+                border=ft.border.all(1.5, "#21394C"),
                 content=ft.Column(
                     spacing=12,
                     controls=[
@@ -3222,10 +3652,10 @@ def main(page: ft.Page):
                         ft.ResponsiveRow(
                             spacing=10,
                             controls=[
-                                ft.Container(col={"xs": 6, "md": 3}, bgcolor="#0B111E", padding=10, border_radius=12, content=ft.Column([ft.Text("VOLUME ACUMULADO", color="#94A3B8", size=10), ft.Text(f"{c.get('total_acumulado_sacas', 4850):,.0f} Sacas", color="#38BDF8", size=16, weight=ft.FontWeight.BOLD)])),
-                                ft.Container(col={"xs": 6, "md": 3}, bgcolor="#0B111E", padding=10, border_radius=12, content=ft.Column([ft.Text("MOVIMENTAÇÃO PARCERIA", color="#94A3B8", size=10), ft.Text(f"R$ {c.get('total_acumulado_reais', 642500):,.2f}", color="#10B981", size=16, weight=ft.FontWeight.BOLD)])),
-                                ft.Container(col={"xs": 6, "md": 3}, bgcolor="#0B111E", padding=10, border_radius=12, content=ft.Column([ft.Text("ÁREA SOJA / ARROZ", color="#94A3B8", size=10), ft.Text(f"{c.get('hectares_soja', 450):.0f} ha / {c.get('hectares_arroz', 300):.0f} ha", color="#FACC15", size=15, weight=ft.FontWeight.BOLD)])),
-                                ft.Container(col={"xs": 6, "md": 3}, bgcolor="#0B111E", padding=10, border_radius=12, content=ft.Column([ft.Text("DEMANDA DE SEMENTES", color="#94A3B8", size=10), ft.Text(f"~{sacas_sem_soja} sc Soja | ~{sacas_sem_arroz} sc Arroz", color="#A855F7", size=13, weight=ft.FontWeight.BOLD)])),
+                                ft.Container(col={"xs": 6, "md": 3}, bgcolor="#0A1826", padding=10, border_radius=12, content=ft.Column([ft.Text("VOLUME ACUMULADO", color="#94A3B8", size=10), ft.Text(f"{c.get('total_acumulado_sacas', 4850):,.0f} Sacas", color="#38BDF8", size=16, weight=ft.FontWeight.BOLD)])),
+                                ft.Container(col={"xs": 6, "md": 3}, bgcolor="#0A1826", padding=10, border_radius=12, content=ft.Column([ft.Text("MOVIMENTAÇÃO PARCERIA", color="#94A3B8", size=10), ft.Text(f"R$ {c.get('total_acumulado_reais', 642500):,.2f}", color="#10B981", size=16, weight=ft.FontWeight.BOLD)])),
+                                ft.Container(col={"xs": 6, "md": 3}, bgcolor="#0A1826", padding=10, border_radius=12, content=ft.Column([ft.Text("ÁREA SOJA / ARROZ", color="#94A3B8", size=10), ft.Text(f"{c.get('hectares_soja', 450):.0f} ha / {c.get('hectares_arroz', 300):.0f} ha", color="#FACC15", size=15, weight=ft.FontWeight.BOLD)])),
+                                ft.Container(col={"xs": 6, "md": 3}, bgcolor="#0A1826", padding=10, border_radius=12, content=ft.Column([ft.Text("DEMANDA DE SEMENTES", color="#94A3B8", size=10), ft.Text(f"~{sacas_sem_soja} sc Soja | ~{sacas_sem_arroz} sc Arroz", color="#A855F7", size=13, weight=ft.FontWeight.BOLD)])),
                             ],
                         ),
                         # Histórico Safra a Safra + Mapa Geográfico Local da Fazenda Lado a Lado
@@ -3234,16 +3664,16 @@ def main(page: ft.Page):
                             controls=[
                                 ft.Container(
                                     col={"xs": 12, "md": 5.5},
-                                    bgcolor="#0B111E",
+                                    bgcolor="#0A1826",
                                     padding=14,
                                     border_radius=14,
-                                    border=ft.border.all(1, "#1E293B"),
+                                    border=ft.border.all(1, "#21394C"),
                                     content=ft.Column(
                                         spacing=6,
                                         controls=[
                                             ft.Text("📜 Histórico de Parceria & Compras por Safra:", color="#FACC15", size=13, weight=ft.FontWeight.BOLD),
                                             linhas_hist_ui,
-                                            ft.Divider(color="#1E293B"),
+                                            ft.Divider(color="#21394C"),
                                             ft.Text(f"🏢 Escritório: {c.get('endereco_escritorio', '')}", color="#94A3B8", size=11),
                                             ft.Text(f"🚜 Roteiro Interior: {c.get('roteiro_lavoura', '')}", color="#38BDF8", size=11),
                                         ],
@@ -3251,7 +3681,14 @@ def main(page: ft.Page):
                                 ),
                                 ft.Container(
                                     col={"xs": 12, "md": 6.5},
-                                    content=ft.Image(src_base64=svg_mapa_cli, height=195, fit=ft.ImageFit.CONTAIN),
+                                    content=ft.Column(spacing=7, controls=[
+                                        ft.Image(src=url_mapa_osm_cliente(lat_l, lon_l), height=195,
+                                            fit=ft.ImageFit.CONTAIN),
+                                        ft.Text("Mapa de ruas (OpenStreetMap). Coordenadas cadastradas, não imagem de satélite nem rota calculada.",
+                                            color="#94A3B8", size=10),
+                                        ft.TextButton("Abrir mapa real da fazenda", on_click=lambda e, la=lat_l, lo=lon_l:
+                                            page.launch_url(f"https://www.google.com/maps?q={la},{lo}")),
+                                    ]),
                                 ),
                             ],
                         ),
@@ -3260,11 +3697,17 @@ def main(page: ft.Page):
             )
         )
 
+      for indice_cli, cliente in enumerate(clientes_u):
+        if indice_cli < len(cards_clientes_completos.controls):
+          index_clientes.append((cards_clientes_completos.controls[indice_cli],
+              (cliente.get("nome", "") + " " + cliente.get("propriedade", "") + " " + cliente.get("cidade_uf", "")).casefold()))
+
       feed_direita = ft.Column(
           spacing=14,
           controls=[
+              campo_pesquisa_clientes,
               ft.Container(
-                  bgcolor="#111927",
+                  bgcolor="#0E2030",
                   padding=18,
                   border_radius=20,
                   border=ft.border.all(1, "#10B981"),
@@ -3283,12 +3726,12 @@ def main(page: ft.Page):
 
     elif sub_aba_perfil == "agenda":
       opcoes_cli = [c["nome"] for c in clientes_u] if clientes_u else ["Produtor Avulso"]
-      ag_cli = ft.Dropdown(label="Cliente", bgcolor="#0B111E", color="#FFFFFF", width=220, options=[ft.dropdown.Option(n) for n in opcoes_cli], value=opcoes_cli[0])
-      ag_prod = ft.Dropdown(label="Produto", bgcolor="#0B111E", color="#FFFFFF", width=190, options=[ft.dropdown.Option(i["nome_curto"]) for i in dados["itens"]], value=dados["itens"][0]["nome_curto"])
-      ag_qtd = ft.TextField(label="Qtd (Sacas/Kg)", value="1000", bgcolor="#0B111E", color="#FFFFFF", width=125)
-      ag_preco = ft.TextField(label="Valor Unit. (R$)", value="73.00", bgcolor="#0B111E", color="#FFFFFF", width=125)
-      ag_frete_sc = ft.TextField(label="Frete/Saca (R$)", value="2.20", bgcolor="#0B111E", color="#FFFFFF", width=125)
-      ag_obs = ft.TextField(label="Observações da Negociação", value="Entrega programada na sede da fazenda", bgcolor="#0B111E", color="#FFFFFF", expand=True)
+      ag_cli = ft.Dropdown(label="Cliente", bgcolor="#0A1826", color="#FFFFFF", width=220, options=[ft.dropdown.Option(n) for n in opcoes_cli], value=opcoes_cli[0])
+      ag_prod = ft.Dropdown(label="Produto", bgcolor="#0A1826", color="#FFFFFF", width=190, options=[ft.dropdown.Option(i["nome_curto"]) for i in dados["itens"]], value=dados["itens"][0]["nome_curto"])
+      ag_qtd = ft.TextField(label="Qtd (Sacas/Kg)", value="1000", bgcolor="#0A1826", color="#FFFFFF", width=125)
+      ag_preco = ft.TextField(label="Valor Unit. (R$)", value="73.00", bgcolor="#0A1826", color="#FFFFFF", width=125)
+      ag_frete_sc = ft.TextField(label="Frete/Saca (R$)", value="2.20", bgcolor="#0A1826", color="#FFFFFF", width=125)
+      ag_obs = ft.TextField(label="Observações da Negociação", value="Entrega programada na sede da fazenda", bgcolor="#0A1826", color="#FFFFFF", expand=True)
 
       def publicar_venda(e):
         try:
@@ -3324,7 +3767,7 @@ def main(page: ft.Page):
           spacing=12,
           controls=[
               ft.Container(
-                  bgcolor="#111927",
+                  bgcolor="#0E2030",
                   padding=18,
                   border_radius=20,
                   content=ft.Column(
@@ -3340,7 +3783,7 @@ def main(page: ft.Page):
                   spacing=10,
                   controls=[
                       ft.Container(
-                          bgcolor="#111927",
+                          bgcolor="#0E2030",
                           padding=16,
                           border_radius=18,
                           content=ft.Column([
@@ -3355,10 +3798,15 @@ def main(page: ft.Page):
       )
 
     elif sub_aba_perfil == "alertas":
-      al_prod = ft.Dropdown(label="Produto", bgcolor="#0B111E", color="#FFFFFF", width=210, options=[ft.dropdown.Option(i["nome_curto"]) for i in dados["itens"]], value=dados["itens"][0]["nome_curto"])
-      al_alvo = ft.TextField(label="Preço-Alvo (R$)", value="74.50", bgcolor="#0B111E", color="#FFFFFF", width=150)
+      al_prod = ft.Dropdown(label="Produto", bgcolor="#0A1826", color="#FFFFFF", width=210, options=[ft.dropdown.Option(i["nome_curto"]) for i in dados["itens"]], value=dados["itens"][0]["nome_curto"])
+      al_alvo = ft.TextField(label="Preço-Alvo (R$)", value="74.50", bgcolor="#0A1826", color="#FFFFFF", width=150)
 
       def add_al(e):
+        try:
+          alvo_novo = numero_usuario(al_alvo.value, 0.01)
+        except (ValueError, TypeError):
+          mostrar_aviso("Digite um preço-alvo válido.", "#EF4444")
+          return
         alertas_u.insert(0, {
             "id": f"al_{len(alertas_u)+1}",
             "cliente_nome": clientes_u[0]["nome"] if clientes_u else "Minha Carteira",
@@ -3366,7 +3814,7 @@ def main(page: ft.Page):
             "produto": al_prod.value,
             "uf": uf_selecionada,
             "tipo_gatilho": "Alta (Venda >= Alvo)",
-            "valor_alvo": float(al_alvo.value.replace(",", ".")),
+            "valor_alvo": alvo_novo,
             "lote_sacas": 1000,
             "criado_em": agora_str(),
         })
@@ -3375,18 +3823,18 @@ def main(page: ft.Page):
         renderizar()
 
       feed_direita = ft.Container(
-          bgcolor="#111927",
+          bgcolor="#0E2030",
           padding=20,
           border_radius=20,
           content=ft.Column(
               spacing=12,
               controls=[
                   ft.Text("🔔 Gatilhos e Alertas de Preço-Alvo", color="#FFFFFF", size=18, weight=ft.FontWeight.BOLD),
-                  ft.Row(spacing=10, controls=[al_prod, al_alvo, ft.ElevatedButton("➕ Criar Alerta", bgcolor="#FACC15", color="#080D16", on_click=add_al)]),
+                  ft.Row(wrap=True, spacing=10, controls=[al_prod, al_alvo, ft.ElevatedButton("➕ Criar Alerta", bgcolor="#FACC15", color="#080D16", on_click=add_al)]),
                   ft.Column(
                       spacing=8,
                       controls=[
-                          ft.Container(bgcolor="#0B111E", padding=14, border_radius=14, border=ft.border.all(1.5, a["cor_al"]), content=ft.Text(f"{a['status_al']} • {a['produto']} ({a['uf']}): Hoje R$ {a['preco_hoje']:.2f} vs Alvo R$ {a['valor_alvo']:.2f}", color=a["cor_al"], size=14, weight=ft.FontWeight.BOLD))
+                          ft.Container(bgcolor="#0A1826", padding=14, border_radius=14, border=ft.border.all(1.5, a["cor_al"]), content=ft.Text(f"{a['status_al']} • {a['produto']} ({a['uf']}): Hoje R$ {a['preco_hoje']:.2f} vs Alvo R$ {a['valor_alvo']:.2f}", color=a["cor_al"], size=14, weight=ft.FontWeight.BOLD))
                           for a in alertas_avaliados
                       ],
                   ),
@@ -3397,13 +3845,47 @@ def main(page: ft.Page):
     else:
       dd_fonte_padrao = ft.Dropdown(
           label="🌐 Fonte Padrão Inicial (Chicago SRW, StoneX, CEPEA, Emater/IRGA...)",
-          bgcolor="#0B111E",
+          bgcolor="#0A1826",
           color="#FFFFFF",
           width=520,
           options=[ft.dropdown.Option(k) for k in FONTES_DISPONIVEIS.keys()],
           value=fonte_analise_ativa,
       )
-      inp_site_custom = ft.TextField(label="🔗 Site Adicional Salvo (ex: StoneX / Agrolink)", value=u_atual.get("site_extra_usuario", "https://www.stonex.com/pt-br/inteligencia-de-mercado/"), bgcolor="#0B111E", color="#FFFFFF", width=520)
+      inp_site_custom = ft.TextField(label="🔗 Site Adicional Salvo (ex: StoneX / Agrolink)", value=u_atual.get("site_extra_usuario", "https://www.stonex.com/pt-br/inteligencia-de-mercado/"), bgcolor="#0A1826", color="#FFFFFF", width=520)
+      inp_nome_perfil = ft.TextField(label="Nome exibido no perfil", value=u_atual.get("nome", ""), width=420)
+      inp_bio_perfil = ft.TextField(label="Apresentação profissional", value=u_atual.get("bio", ""), multiline=True, min_lines=2, max_lines=4, width=520)
+      senha_antiga = ft.TextField(label="Senha atual", password=True, width=210)
+      senha_nova = ft.TextField(label="Nova senha (mínimo 10 caracteres)", password=True, width=275)
+      senha_repetir = ft.TextField(label="Repetir nova senha", password=True, width=240)
+
+      def atualizar_perfil(e):
+        nome = inp_nome_perfil.value.strip()
+        if len(nome) < 2:
+          mostrar_aviso("Digite um nome válido para o perfil.", "#EF4444")
+          return
+        u_atual["nome"] = nome[:100]
+        u_atual["bio"] = inp_bio_perfil.value.strip()[:650]
+        salvar_banco_usuarios(db_usuarios)
+        mostrar_aviso("Dados do perfil atualizados!")
+        renderizar()
+
+      def atualizar_senha(e):
+        atual = senha_antiga.value or ""
+        nova = senha_nova.value or ""
+        if not verificar_senha(atual, u_atual.get("senha_hash", "")):
+          mostrar_aviso("Senha atual incorreta.", "#EF4444")
+          return
+        if len(nova) < 10 or not any(c.isdigit() for c in nova) or not any(c.isalpha() for c in nova):
+          mostrar_aviso("A senha deve ter 10 caracteres ou mais, letras e números.", "#EF4444")
+          return
+        if nova != senha_repetir.value:
+          mostrar_aviso("As novas senhas não coincidem.", "#EF4444")
+          return
+        u_atual["senha_hash"] = criar_hash_senha_segura(nova)
+        salvar_banco_usuarios(db_usuarios)
+        senha_antiga.value = senha_nova.value = senha_repetir.value = ""
+        mostrar_aviso("Senha atualizada com proteção PBKDF2!")
+        renderizar()
 
       def guardar_cfg(e):
         nonlocal fonte_analise_ativa
@@ -3415,7 +3897,7 @@ def main(page: ft.Page):
         renderizar()
 
       feed_direita = ft.Container(
-          bgcolor="#111927",
+          bgcolor="#0E2030",
           padding=22,
           border_radius=20,
           content=ft.Column(
@@ -3425,6 +3907,15 @@ def main(page: ft.Page):
                   dd_fonte_padrao,
                   inp_site_custom,
                   ft.ElevatedButton("💾 Guardar Configurações", bgcolor="#10B981", color="#080D16", on_click=guardar_cfg),
+                  ft.Divider(color="#263D52"),
+                  ft.Text("👤 Meu perfil", size=18, color="#FFFFFF", weight=ft.FontWeight.BOLD),
+                  inp_nome_perfil, inp_bio_perfil,
+                  ft.ElevatedButton("Salvar informações do perfil", bgcolor="#38BDF8", color="#07111C", on_click=atualizar_perfil),
+                  ft.ElevatedButton("📸 Alterar foto de perfil", bgcolor="#263D52", color="#FFFFFF", on_click=escolher_foto),
+                  ft.Divider(color="#263D52"),
+                  ft.Text("🔐 Alterar minha senha", color="#FFFFFF", weight=ft.FontWeight.BOLD),
+                  ft.Row(wrap=True, spacing=8, controls=[senha_antiga, senha_nova, senha_repetir]),
+                  ft.ElevatedButton("Atualizar senha com segurança", bgcolor="#EAB308", color="#07111C", on_click=atualizar_senha),
               ],
           ),
       )
@@ -3463,7 +3954,7 @@ def main(page: ft.Page):
 
     dd_polo = ft.Dropdown(
         label="📍 Polo Climático Selecionado",
-        bgcolor="#0B111E",
+        bgcolor="#0A1826",
         color="#FFFFFF",
         width=440,
         options=[ft.dropdown.Option(k) for k in POLOS_CLIMA_BRASIL.keys()],
@@ -3477,10 +3968,10 @@ def main(page: ft.Page):
       cards_10d.controls.append(
           ft.Container(
               col={"xs": 6, "sm": 4, "md": 2.4},
-              bgcolor="#0B111E",
+              bgcolor="#0A1826",
               padding=10,
               border_radius=12,
-              border=ft.border.all(1, "#38BDF8" if chove else "#1E293B"),
+              border=ft.border.all(1, "#38BDF8" if chove else "#21394C"),
               content=ft.Column(
                   horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                   spacing=2,
@@ -3500,7 +3991,7 @@ def main(page: ft.Page):
       botoes_estacoes.controls.append(
           ft.ElevatedButton(
               f"✓ 🌦️ {nome_est}" if ativo else f"🌦️ {nome_est}",
-              bgcolor="#10B981" if ativo else "#1E293B",
+              bgcolor="#10B981" if ativo else "#21394C",
               color="#080D16" if ativo else "#FFFFFF",
               height=34,
               on_click=lambda e, es=nome_est: mudar_est_btn(es),
@@ -3508,10 +3999,10 @@ def main(page: ft.Page):
       )
 
     return ft.Container(
-        bgcolor="#111927",
+        bgcolor="#0E2030",
         padding=20,
         border_radius=24,
-        border=ft.border.all(1.5, "#1E293B"),
+        border=ft.border.all(1.5, "#21394C"),
         content=ft.Column(
             spacing=14,
             controls=[
@@ -3596,7 +4087,7 @@ def main(page: ft.Page):
     )
 
     return ft.Container(
-        bgcolor="#111927",
+        bgcolor="#0E2030",
         padding=22,
         border_radius=24,
         border=ft.border.all(1.5, "#10B981"),
@@ -3637,10 +4128,10 @@ def main(page: ft.Page):
                         # Instruções e Legenda de Marketing
                         ft.Container(
                             col={"xs": 12, "md": 6},
-                            bgcolor="#0B111E",
+                            bgcolor="#0A1826",
                             padding=20,
                             border_radius=20,
-                            border=ft.border.all(1, "#1E293B"),
+                            border=ft.border.all(1, "#21394C"),
                             content=ft.Column(
                                 spacing=12,
                                 controls=[
@@ -3648,9 +4139,9 @@ def main(page: ft.Page):
                                     ft.Text("1. Escolha acima a Região, o Estado e a Região Interna que deseja destacar no boletim de hoje.", color="#E2E8F0", size=13),
                                     ft.Text("2. No Windows, prima 'Win + Shift + S' para recortar o Card ao lado (ou clique em 'Abrir Card em Tela Cheia').", color="#E2E8F0", size=13),
                                     ft.Text("3. O Card já inclui ilustrações temáticas de lavoura, clima de 10 dias, cotações do dia, fontes auditadas (Chicago SRW / StoneX / CEPEA) e o seu nome + WhatsApp como propaganda oficial!", color="#10B981", size=13),
-                                    ft.Divider(color="#1E293B"),
+                                    ft.Divider(color="#21394C"),
                                     ft.Text("📝 Legenda Automática Pronta para Colar:", color="#38BDF8", size=14, weight=ft.FontWeight.BOLD),
-                                    ft.Container(bgcolor="#111927", padding=14, border_radius=12, content=ft.Text(legenda_pronta, color="#CBD5E1", size=12)),
+                                    ft.Container(bgcolor="#0E2030", padding=14, border_radius=12, content=ft.Text(legenda_pronta, color="#CBD5E1", size=12)),
                                 ],
                             ),
                         ),
@@ -3672,12 +4163,12 @@ def main(page: ft.Page):
       if usuario_logado_key:
         db_usuarios["usuarios"][usuario_logado_key]["voz_ia"] = nova_v
         salvar_banco_usuarios(db_usuarios)
-      falar_resposta_ia(f"Voz {nova_v.split()[0]} ativada no C R AgroStat.", nova_v)
+      falar_navegador(f"Voz {nova_v.split()[0]} selecionada no C R AgroStat.", nova_v)
       renderizar()
 
     inp_pergunta_ia = ft.TextField(
         label="🎙️ Digite ou fale sua pergunta sobre Grãos, Trigo, Soja, Arroz, StoneX, Clima, Frete ou Barter...",
-        bgcolor="#0B111E",
+        bgcolor="#0A1826",
         color="#FFFFFF",
         border_radius=14,
         border_color="#10B981",
@@ -3689,24 +4180,28 @@ def main(page: ft.Page):
       if not q:
         return
       historico_chat_ia.append({"autor": "Você", "hora": agora_str(), "texto": q})
-      resp = responder_ia_agronegocio(q, dados, uf_selecionada, subregiao_selecionada, polo_clima_sel, fonte_analise_ativa)
+      resp_local = responder_ia_agronegocio(q, dados, uf_selecionada, subregiao_selecionada, polo_clima_sel, fonte_analise_ativa)
+      resp_local = "[Analisador local; preços indicativos e cenários, não cotações oficiais] " + resp_local
+      resp = resposta_ia_com_api_opcional(q, dados, uf_selecionada, subregiao_selecionada, resp_local)
       historico_chat_ia.append({"autor": f"🤖 IA Agro ({voz_selecionada})", "hora": agora_str(), "texto": resp})
       inp_pergunta_ia.value = ""
       if alar_automatico_ia:
-        falar_resposta_ia(resp, voz_selecionada)
+        falar_navegador(resp, voz_selecionada)
       renderizar()
 
-    def ditado_por_voz_windows(e):
-      """Ativa escuta de microfone via SAPI/Speech ou abre ditado nativo e responde."""
-      mostrar_aviso("🎙️ Microfone ativado! Fazendo leitura do panorama completo por voz...")
-      enviar_pergunta_ia("Me dê um resumo falado completo de mercado da StoneX, Chicago SRW, Trigo, Soja, Arroz e Clima de hoje")
+    def instrucoes_ditado(e):
+      mostrar_aviso("Para ditar: clique no campo e use o microfone do teclado do celular ou Win+H no Windows.", "#38BDF8")
+      inp_pergunta_ia.focus()
+
+    def boletim_mercado(e):
+      enviar_pergunta_ia("Resuma os dados estimados de trigo, soja, arroz, milho, dólar e clima, distinguindo fatos e cenários.")
 
     mensagens_ui = ft.Column(spacing=10)
     for m in historico_chat_ia[-8:]:
       eh_ia = "IA" in m["autor"]
       mensagens_ui.controls.append(
           ft.Container(
-              bgcolor="#0B111E" if eh_ia else "#052E16",
+              bgcolor="#0A1826" if eh_ia else "#052E16",
               padding=16,
               border_radius=16,
               border=ft.border.all(1.5, "#38BDF8" if eh_ia else "#10B981"),
@@ -3723,10 +4218,10 @@ def main(page: ft.Page):
                                       ft.Text(m["hora"], color="#64748B", size=11),
                                       ft.ElevatedButton(
                                           "🔊 Ouvir com Voz",
-                                          bgcolor="#1E293B",
+                                          bgcolor="#21394C",
                                           color="#38BDF8",
                                           height=28,
-                                          on_click=lambda e, tx=m["texto"]: falar_resposta_ia(tx, voz_selecionada),
+                                          on_click=lambda e, tx=m["texto"]: falar_navegador(tx, voz_selecionada),
                                       ),
                                   ],
                               ),
@@ -3747,7 +4242,7 @@ def main(page: ft.Page):
     ]
 
     return ft.Container(
-        bgcolor="#111927",
+        bgcolor="#0E2030",
         padding=22,
         border_radius=24,
         border=ft.border.all(1.5, "#38BDF8"),
@@ -3760,21 +4255,21 @@ def main(page: ft.Page):
                     controls=[
                         ft.Column([
                             ft.Text("🤖 Inteligência Artificial do Agronegócio — Conversa por Escrita e Voz", color="#FFFFFF", size=21, weight=ft.FontWeight.BOLD),
-                            ft.Text("Escolha entre Voz Masculina ou Feminina. A IA analisa Chicago SRW, StoneX, CEPEA e o Clima da sua região em tempo real.", color="#38BDF8", size=13),
+                            ft.Text("Áudio no navegador. Respostas baseadas em estimativas locais; IA generativa opcional com OPENAI_API_KEY.", color="#38BDF8", size=13),
                         ]),
                         ft.Row(
                             spacing=8,
                             controls=[
                                 ft.ElevatedButton(
                                     "✓ 👩 Voz Feminina (Analista)" if "Feminina" in voz_selecionada else "👩 Voz Feminina (Analista)",
-                                    bgcolor="#10B981" if "Feminina" in voz_selecionada else "#1E293B",
+                                    bgcolor="#10B981" if "Feminina" in voz_selecionada else "#21394C",
                                     color="#080D16" if "Feminina" in voz_selecionada else "#FFFFFF",
                                     height=38,
                                     on_click=lambda e: escolher_voz("Feminina (Analista Agro)"),
                                 ),
                                 ft.ElevatedButton(
                                     "✓ 👨 Voz Masculina (Consultor)" if "Masculina" in voz_selecionada else "👨 Voz Masculina (Consultor)",
-                                    bgcolor="#38BDF8" if "Masculina" in voz_selecionada else "#1E293B",
+                                    bgcolor="#38BDF8" if "Masculina" in voz_selecionada else "#21394C",
                                     color="#080D16" if "Masculina" in voz_selecionada else "#FFFFFF",
                                     height=38,
                                     on_click=lambda e: escolher_voz("Masculina (Consultor Agro)"),
@@ -3787,22 +4282,84 @@ def main(page: ft.Page):
                     wrap=True,
                     spacing=8,
                     controls=[
-                        ft.ElevatedButton(rot, bgcolor="#1E293B", color="#FACC15", height=34, on_click=lambda e, p=perg: enviar_pergunta_ia(p))
+                        ft.ElevatedButton(rot, bgcolor="#21394C", color="#FACC15", height=34, on_click=lambda e, p=perg: enviar_pergunta_ia(p))
                         for rot, perg in perguntas_rapidas
                     ],
                 ),
+                ft.Row(wrap=True, spacing=8, controls=[
+                    ft.ElevatedButton("🔈 Boletim falado", bgcolor="#FACC15", color="#080D16", on_click=boletim_mercado),
+                    ft.ElevatedButton("⏹ Parar áudio", bgcolor="#263D52", color="#FFFFFF", on_click=parar_audio),
+                    ft.Text("Voz masculina/feminina natural disponível quando edge-tts estiver instalado no servidor.", color="#94A3B8", size=11),
+                ]),
                 mensagens_ui,
-                ft.Row(
-                    spacing=10,
-                    controls=[
-                        inp_pergunta_ia,
-                        ft.ElevatedButton("💬 Perguntar & Ouvir", bgcolor="#10B981", color="#080D16", height=48, on_click=lambda e: enviar_pergunta_ia()),
-                        ft.ElevatedButton("🎙️ Boletim Falado Agora", bgcolor="#FACC15", color="#080D16", height=48, on_click=ditado_por_voz_windows),
-                    ],
-                ),
+                ft.Column(spacing=9, controls=[
+                    inp_pergunta_ia,
+                    ft.Row(wrap=True, spacing=8, controls=[
+                        ft.ElevatedButton("💬 Perguntar & Ouvir", bgcolor="#10B981", color="#080D16", height=44, on_click=lambda e: enviar_pergunta_ia()),
+                        ft.ElevatedButton("🎙️ Como ditar", bgcolor="#21394C", color="#FACC15", height=44, on_click=instrucoes_ditado),
+                    ]),
+                ]),
             ],
         ),
     )
+
+  # =========================================================================
+  # ABA EXTRA: COMPARADOR DE PREÇOS, FAVORITOS E TRANSPARÊNCIA DOS DADOS
+  # =========================================================================
+  def construir_comparador_mercado():
+    u = db_usuarios["usuarios"].get(usuario_logado_key, {})
+    favoritos = u.setdefault("favoritos_produtos", [])
+    produto_selecionado = ft.Dropdown(label="Produto", width=290,
+        value=dados["itens"][0]["id"], options=[ft.dropdown.Option(i["id"], i["nome_curto"]) for i in dados["itens"]])
+    estados_options = sorted({uf for ufs in HIERARQUIA_BRASIL.values() for uf in ufs})
+    estados_comp = ft.Dropdown(label="Comparar com estado", width=200,
+        value="PR" if uf_selecionada != "PR" else "SC",
+        options=[ft.dropdown.Option(uf) for uf in estados_options])
+    tabela_comparacao = ft.Column(spacing=7)
+
+    def montar_comparacao(e=None):
+      tabela_comparacao.controls.clear()
+      item = next((i for i in dados["itens"] if i["id"] == produto_selecionado.value), dados["itens"][0])
+      outros_estados = [uf_selecionada, estados_comp.value]
+      for estado in dict.fromkeys(outros_estados):
+        for nome_sub in SUBREGIOES_ESTADOS.get(estado, {}):
+          valor = calcular_preco_dinamico_atual(item, estado, nome_sub, fonte_analise_ativa)
+          tabela_comparacao.controls.append(ft.Container(bgcolor="#0E2531", padding=12, border_radius=11,
+             content=ft.Row(wrap=True, alignment=ft.MainAxisAlignment.SPACE_BETWEEN, controls=[
+                ft.Text(f"{estado} • {nome_sub}", color="#E2E8F0", size=12),
+                ft.Text(dinheiro_br(valor), color="#37E0B6", size=15, weight=ft.FontWeight.BOLD)
+             ])))
+      page.update()
+
+    def alternar_favorito(e):
+      codigo = produto_selecionado.value
+      if codigo in favoritos: favoritos.remove(codigo)
+      else: favoritos.append(codigo)
+      salvar_banco_usuarios(db_usuarios)
+      mostrar_aviso("Favoritos atualizados.")
+      renderizar()
+
+    montar_comparacao()
+    return ft.Container(bgcolor="#0E2030", padding=22, border_radius=22,
+       content=ft.Column(spacing=14, controls=[
+          ft.Text("📊 Comparador de Mercados", color="#FFFFFF", size=23, weight=ft.FontWeight.BOLD),
+          ft.Text("Comparação indicativa calculada com multiplicadores regionais. Não representa preços efetivamente coletados nas praças.",
+                  color="#FACC15", size=12),
+          ft.Row(wrap=True, spacing=10, controls=[produto_selecionado, estados_comp,
+             ft.ElevatedButton("Comparar agora", bgcolor="#10B981", color="#07111C", on_click=montar_comparacao),
+             ft.ElevatedButton("⭐ Adicionar/remover favorito", bgcolor="#263D52", color="#FFFFFF", on_click=alternar_favorito)]),
+          ft.Text("🌟 Meus favoritos: " + (", ".join(next((i["nome_curto"] for i in dados["itens"] if i["id"]==a), a) for a in favoritos) or "Nenhum"),
+                  color="#38BDF8", size=12),
+          tabela_comparacao,
+          ft.Divider(color="#263D52"),
+          ft.Text("🔎 Entenda seus indicadores", color="#FFFFFF", size=17, weight=ft.FontWeight.BOLD),
+          ft.Text("Câmbio e contratos de Chicago são consultados no Yahoo Finance quando a rede e o mercado permitem. "
+                  "Os preços regionais, diferenças entre fontes e tendências são modelos indicativos calculados no aplicativo. "
+                  "Não equivalem a dados licenciados da StoneX, CEPEA ou Emater.", color="#CBD5E1", size=12),
+          ft.Text(f"Última referência de dados: {dados.get('atualizacao','Não informado')}", color="#94A3B8", size=12),
+          ft.ElevatedButton("Consultar fonte oficial CEPEA", bgcolor="#263D52", color="#E2E8F0",
+              on_click=lambda e: page.launch_url("https://www.cepea.esalq.usp.br/br")),
+       ]))
 
   # =========================================================================
   # RENDERIZAÇÃO GERAL COM BARRA LATERAL ESQUERDA E FOTO GRANDE
@@ -3822,16 +4379,17 @@ def main(page: ft.Page):
         ("regional", "Contratos & Praças BR", ft.icons.MAP_ROUNDED),
         ("frete", "Estudo de Fretes (KM)", ft.icons.LOCAL_SHIPPING_ROUNDED),
         ("barter", "Simulador Barter", ft.icons.CALCULATE_ROUNDED),
+        ("comparador", "Comparador & Favoritos", ft.icons.COMPARE_ARROWS_ROUNDED),
     ]
 
     coluna_lateral_menu.controls.clear()
     # Topo da Coluna Lateral Esquerda com FOTO QUADRADA ARREDONDADA BEM MAIOR (112x112)
     coluna_lateral_menu.controls.append(
         ft.Container(
-            bgcolor="#0B111E",
+            bgcolor="#0A1826",
             padding=16,
             border_radius=22,
-            border=ft.border.all(1.5, "#1E293B"),
+            border=ft.border.all(1.5, "#21394C"),
             content=ft.Column(
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                 spacing=8,
@@ -3842,13 +4400,13 @@ def main(page: ft.Page):
                     ft.Text(f"📍 {uf_selecionada} • {subregiao_selecionada[:24]}", color="#FACC15", size=11, text_align=ft.TextAlign.CENTER),
                     ft.ElevatedButton(
                         "📸 Trocar Foto",
-                        bgcolor="#1E293B",
+                        bgcolor="#21394C",
                         color="#38BDF8",
                         height=28,
-                        on_click=lambda e: seletor_foto.pick_files(allow_multiple=False),
+                        on_click=escolher_foto,
                     ),
                     ft.Container(
-                        bgcolor="#111927",
+                        bgcolor="#0E2030",
                         padding=8,
                         border_radius=10,
                         width=float("inf"),
@@ -3873,11 +4431,11 @@ def main(page: ft.Page):
               icon=icone_aba,
               width=250,
               height=41,
-              bgcolor="#10B981" if esta_ativa else "#111927",
+              bgcolor="#10B981" if esta_ativa else "#0E2030",
               color="#080D16" if esta_ativa else "#E2E8F0",
               style=ft.ButtonStyle(
                   alignment=ft.alignment.center_left,
-                  side={"": ft.BorderSide(2 if esta_ativa else 1, "#FACC15" if esta_ativa else "#1E293B")},
+                  side={"": ft.BorderSide(2 if esta_ativa else 1, "#FACC15" if esta_ativa else "#21394C")},
                   shape=ft.RoundedRectangleBorder(radius=13),
               ),
               on_click=lambda e, k=chave_aba: mudar_aba(k),
@@ -3891,10 +4449,45 @@ def main(page: ft.Page):
         ft.ElevatedButton("📄 Gerar PDF Oficial", bgcolor="#FACC15", color="#080D16", width=250, height=38, on_click=lambda e: gerar_pdf_completo_usuario("Relatorio Oficial"))
     )
 
-    # Conteúdo da Direita
+    # Barra editorial do painel: hierarquia visual e atualização dos dados.
     area_conteudo_direita.controls.clear()
+    area_conteudo_direita.controls.append(ft.Container(
+        padding=ft.padding.symmetric(horizontal=20, vertical=15), border_radius=20,
+        gradient=ft.LinearGradient(begin=ft.alignment.top_left, end=ft.alignment.bottom_right,
+            colors=["#173949", "#0F2635", "#0C1927"]),
+        border=ft.border.all(1, "#235E59"),
+        content=ft.ResponsiveRow(spacing=6, controls=[
+            ft.Container(col={"xs":12,"lg":7}, content=ft.Column(spacing=4, controls=[
+                ft.Text("CR  /  AGROSTAT", color="#5CEAC4", size=13, weight=ft.FontWeight.BOLD),
+                ft.Text("Inteligência que cultiva decisões", color="#FFFFFF", size=23, weight=ft.FontWeight.BOLD),
+                ft.Text(f"{uf_selecionada} • {subregiao_selecionada}", color="#B9D5DD", size=11),
+            ])),
+            ft.Container(col={"xs":12,"lg":5}, content=ft.Column(spacing=4, controls=[
+                ft.Text("ÚLTIMA REFERÊNCIA", color="#8CB8C3", size=10, weight=ft.FontWeight.BOLD),
+                ft.Text(dados.get("atualizacao", "Sem atualização"), color="#F7FBFD", size=14, weight=ft.FontWeight.BOLD),
+                ft.Text("Preços regionais simulados • ver fontes no Comparador", color="#FACC15", size=11),
+            ])),
+        ])))
 
     if aba_atual == "painel":
+      total_clientes = len(u_atual.get("clientes", []))
+      qtd_agendamentos = len(u_atual.get("agenda_vendas", []))
+      area_total = sum(float(c.get("hectares_soja",0) or 0) + float(c.get("hectares_arroz",0) or 0)
+                       for c in u_atual.get("clientes", []))
+      kpis = ft.ResponsiveRow(spacing=10)
+      for titulo, valor, nota, cor in [
+          ("CLIENTES NA CARTEIRA", str(total_clientes), "CRM comercial", "#38BDF8"),
+          ("ÁREA ASSISTIDA", f"{area_total:,.0f} ha".replace(",","."), "Soja + arroz", "#34D399"),
+          ("NEGOCIAÇÕES", str(qtd_agendamentos), "Agenda e vendas", "#FACC15"),
+          ("DÓLAR DE REFERÊNCIA", dinheiro_br(dados.get("dolar",0)), "Yahoo quando disponível", "#D8B4FE"),
+      ]:
+        kpis.controls.append(ft.Container(col={"xs":6,"lg":3}, bgcolor="#112435", padding=16,
+            border_radius=16, border=ft.border.all(1,"#214255"), content=ft.Column(spacing=6, controls=[
+                ft.Text(titulo, color="#9FC4CD", size=10, weight=ft.FontWeight.BOLD),
+                ft.Text(valor, color=cor, size=24, weight=ft.FontWeight.BOLD),
+                ft.Text(nota, color="#9CAFC3", size=11),
+            ])))
+      area_conteudo_direita.controls.append(kpis)
       area_conteudo_direita.controls.append(construir_bloco_terminal_chicago())
 
       grade = ft.ResponsiveRow(spacing=14, run_spacing=14)
@@ -3912,22 +4505,25 @@ def main(page: ft.Page):
         grade.controls.append(
             ft.Container(
                 col={"xs": 12, "md": 6, "xl": 3},
-                bgcolor="#111927",
+                bgcolor="#0E2030",
                 padding=16,
                 border_radius=18,
-                border=ft.border.all(2 if idx == item_grafico_idx else 1, item["cor"] if idx == item_grafico_idx else "#1E293B"),
+                border=ft.border.all(2 if idx == item_grafico_idx else 1, item["cor"] if idx == item_grafico_idx else "#21394C"),
                 content=ft.Column(
                     spacing=6,
                     controls=[
                         ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN, controls=[ft.Text(item["nome_curto"], color="#FFFFFF", size=16, weight=ft.FontWeight.BOLD), ft.Text(item["codigo_cbot"], color="#38BDF8", size=11, weight=ft.FontWeight.BOLD)]),
                         ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN, controls=[ft.Text(f"R$ {preco_din:.2f}", color="#FFFFFF", size=24, weight=ft.FontWeight.BOLD), ft.Text(f"{sinal}{item['var_dia']:.2f}%", color="#22C55E" if alta else "#F87171", size=12, weight=ft.FontWeight.BOLD)]),
                         ft.Text(f"Média {uf_selecionada}: R$ {m_uf.get(uf_selecionada, preco_din):.2f} | Sul: R$ {m_uf['SUL']:.2f}", color="#10B981", size=11, weight=ft.FontWeight.BOLD),
-                        ft.ElevatedButton("✓ No Topo" if idx == item_grafico_idx else "🔍 Analisar", bgcolor=item["cor"] if idx == item_grafico_idx else "#1E293B", color="#080D16" if idx == item_grafico_idx else "#FFFFFF", height=30, width=float("inf"), on_click=selecionar_card),
+                        ft.ElevatedButton("✓ No Topo" if idx == item_grafico_idx else "🔍 Analisar", bgcolor=item["cor"] if idx == item_grafico_idx else "#21394C", color="#080D16" if idx == item_grafico_idx else "#FFFFFF", height=30, width=float("inf"), on_click=selecionar_card),
                     ],
                 ),
             )
         )
       area_conteudo_direita.controls.append(grade)
+
+    elif aba_atual == "comparador":
+      area_conteudo_direita.controls.append(construir_comparador_mercado())
 
     elif aba_atual == "mapa":
       area_conteudo_direita.controls.append(construir_aba_mapa_clicavel())
@@ -3952,7 +4548,7 @@ def main(page: ft.Page):
         dif = val_p - item_reg["contrato_empresa"]
         linhas_reg.controls.append(
             ft.Container(
-                bgcolor="#0B111E",
+                bgcolor="#0A1826",
                 padding=12,
                 border_radius=12,
                 content=ft.Row(
@@ -3965,13 +4561,13 @@ def main(page: ft.Page):
             )
         )
       area_conteudo_direita.controls.append(
-          ft.Container(bgcolor="#111927", padding=20, border_radius=24, content=ft.Column(spacing=12, controls=[ft.Text("🗺️ Contratos & Sub-Regiões dos Estados", color="#FFFFFF", size=20, weight=ft.FontWeight.BOLD), construir_seletor_triplo_regioes(), linhas_reg]))
+          ft.Container(bgcolor="#0E2030", padding=20, border_radius=24, content=ft.Column(spacing=12, controls=[ft.Text("🗺️ Contratos & Sub-Regiões dos Estados", color="#FFFFFF", size=20, weight=ft.FontWeight.BOLD), construir_seletor_triplo_regioes(), linhas_reg]))
       )
 
     elif aba_atual == "frete":
-      c_km = ft.TextField(label="Distância (KM)", value="220", bgcolor="#0B111E", color="#FFFFFF", width=150)
-      c_rkm = ft.TextField(label="R$/km", value="6.80", bgcolor="#0B111E", color="#FFFFFF", width=150)
-      c_ton = ft.TextField(label="Toneladas", value="32", bgcolor="#0B111E", color="#FFFFFF", width=150)
+      c_km = ft.TextField(label="Distância (KM)", value="220", bgcolor="#0A1826", color="#FFFFFF", width=150)
+      c_rkm = ft.TextField(label="R$/km", value="6.80", bgcolor="#0A1826", color="#FFFFFF", width=150)
+      c_ton = ft.TextField(label="Toneladas", value="32", bgcolor="#0A1826", color="#FFFFFF", width=150)
       res_f = ft.Text("Custo Viagem: R$ 1.496,00 | Saca 60kg: R$ 2,80", color="#10B981", size=16, weight=ft.FontWeight.BOLD)
 
       def calc_f(e):
@@ -3984,12 +4580,12 @@ def main(page: ft.Page):
           pass
 
       area_conteudo_direita.controls.append(
-          ft.Container(bgcolor="#111927", padding=22, border_radius=24, content=ft.Column(spacing=14, controls=[ft.Text("🚛 Estudo Logístico de Fretes (KM)", color="#FFFFFF", size=20, weight=ft.FontWeight.BOLD), ft.Row(spacing=10, controls=[c_km, c_rkm, c_ton, ft.ElevatedButton("Calcular", bgcolor="#FACC15", color="#080D16", on_click=calc_f)]), res_f]))
+          ft.Container(bgcolor="#0E2030", padding=22, border_radius=24, content=ft.Column(spacing=14, controls=[ft.Text("🚛 Estudo Logístico de Fretes (KM)", color="#FFFFFF", size=20, weight=ft.FontWeight.BOLD), ft.Row(wrap=True, spacing=10, controls=[c_km, c_rkm, c_ton, ft.ElevatedButton("Calcular", bgcolor="#FACC15", color="#080D16", on_click=calc_f)]), res_f]))
       )
 
     else:
-      s_pr = ft.TextField(label="Preço Grão (R$)", value="134.24", bgcolor="#0B111E", color="#FFFFFF", width=160)
-      s_sem = ft.TextField(label="Preço Semente (R$)", value="291.00", bgcolor="#0B111E", color="#FFFFFF", width=160)
+      s_pr = ft.TextField(label="Preço Grão (R$)", value="134.24", bgcolor="#0A1826", color="#FFFFFF", width=160)
+      s_sem = ft.TextField(label="Preço Semente (R$)", value="291.00", bgcolor="#0A1826", color="#FFFFFF", width=160)
       res_b = ft.Text("Relação Barter: 2,17 sacas de grão por 1 semente certificada.", color="#10B981", size=16, weight=ft.FontWeight.BOLD)
 
       def calc_b(e):
@@ -4001,7 +4597,7 @@ def main(page: ft.Page):
           pass
 
       area_conteudo_direita.controls.append(
-          ft.Container(bgcolor="#111927", padding=22, border_radius=24, content=ft.Column(spacing=14, controls=[ft.Text("⚖️ Simulador Barter", color="#FFFFFF", size=20, weight=ft.FontWeight.BOLD), ft.Row(spacing=10, controls=[s_pr, s_sem, ft.ElevatedButton("Simular", bgcolor="#10B981", color="#080D16", on_click=calc_b)]), res_b]))
+          ft.Container(bgcolor="#0E2030", padding=22, border_radius=24, content=ft.Column(spacing=14, controls=[ft.Text("⚖️ Simulador Barter", color="#FFFFFF", size=20, weight=ft.FontWeight.BOLD), ft.Row(wrap=True, spacing=10, controls=[s_pr, s_sem, ft.ElevatedButton("Simular", bgcolor="#10B981", color="#080D16", on_click=calc_b)]), res_b]))
       )
 
     page.update()
@@ -4025,27 +4621,47 @@ def main(page: ft.Page):
       page.update()
       return
 
-    raiz_pagina.content = ft.Row(
-        expand=True,
-        spacing=14,
-        vertical_alignment=ft.CrossAxisAlignment.START,
-        controls=[
-            ft.Container(
-                width=272,
-                bgcolor="#111927",
-                padding=14,
-                border_radius=24,
-                border=ft.border.all(1.5, "#1E293B"),
-                content=coluna_lateral_menu,
-            ),
-            ft.Container(
-                expand=True,
-                content=area_conteudo_direita,
-            ),
-        ],
-    )
+    definicao_mobile = [
+        ("painel", "Painel / Chicago"), ("mapa", "Mapa do Brasil"),
+        ("perfil", "Perfil e Clientes"), ("clima", "Clima"),
+        ("stories", "Stories"), ("ia_voz", "IA / Voz"),
+        ("regional", "Contratos"), ("frete", "Fretes"),
+        ("barter", "Barter"), ("comparador", "Comparador"),
+    ]
+    if (page.width or 1200) < 825:
+      nav_mobile = ft.Dropdown(label="☰ Ir para...", width=250, value=aba_atual,
+          options=[ft.dropdown.Option(k, nome) for k, nome in definicao_mobile],
+          on_change=lambda e: mudar_aba(e.control.value))
+      raiz_pagina.content = ft.Column(expand=True, spacing=9, controls=[
+          ft.Container(bgcolor="#0D2633", padding=10, border_radius=14,
+            content=ft.Row(wrap=True, spacing=8, controls=[
+                ft.Text("🌾 CR AgroStat", size=19, color="#52E1BB", weight=ft.FontWeight.BOLD),
+                nav_mobile,
+                ft.IconButton(icon=ft.icons.REFRESH_ROUNDED, icon_color="#38BDF8", on_click=acao_atualizar),
+                ft.IconButton(icon=ft.icons.PICTURE_AS_PDF_ROUNDED, icon_color="#FACC15",
+                              on_click=lambda e: gerar_pdf_completo_usuario("Relatório Oficial")),
+            ])),
+          area_conteudo_direita,
+      ])
+    else:
+      raiz_pagina.content = ft.Row(
+          expand=True, spacing=14, vertical_alignment=ft.CrossAxisAlignment.START,
+          controls=[
+              ft.Container(width=272, bgcolor="#0E1D2B", padding=14, border_radius=24,
+                           border=ft.border.all(1.5, "#234050"), content=coluna_lateral_menu),
+              ft.Container(expand=True, content=area_conteudo_direita),
+          ])
     renderizar()
 
+  def verificar_responsividade(e):
+    nonlocal menu_mobile_ativo
+    novo_mobile = (page.width or 1200) < 825
+    if novo_mobile != menu_mobile_ativo:
+      menu_mobile_ativo = novo_mobile
+      montar_sistema()
+
+  menu_mobile_ativo = (page.width or 1200) < 825
+  page.on_resize = verificar_responsividade
   page.add(raiz_pagina)
   montar_sistema()
 
@@ -4059,4 +4675,5 @@ if __name__ == "__main__":
       host="0.0.0.0",
       port=porta_servidor,
       assets_dir=PASTA_ASSETS,
+      upload_dir=PASTA_UPLOADS,
   )
